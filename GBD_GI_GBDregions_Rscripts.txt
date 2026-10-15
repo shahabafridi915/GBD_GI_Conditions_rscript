@@ -1,0 +1,2634 @@
+# ============================================================
+# SCRIPT 07 — BLOCK A: Libraries and Directory Setup
+# Regional GBD 2023 GI Surgery Analysis
+# ============================================================
+
+library(dplyr)
+library(readr)
+library(openxlsx)
+library(segmented)
+library(forecast)
+library(tseries)
+
+DATA_DIR   <- "D:/Research/GBD GI Surgery Burden/GBD_GI_GBDregions/Raw Data/"
+OUTPUT_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_GBDregions/outputs/"
+
+# Create output folder if it does not exist yet
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+cat("Libraries loaded.\n")
+cat("Data directory   :", DATA_DIR,   "\n")
+cat("Output directory :", OUTPUT_DIR, "\n")
+
+
+
+# ============================================================
+# SCRIPT 07 — BLOCK B: Load Raw Regional CSV Files
+# ============================================================
+
+raw_app <- readr::read_csv(
+  file.path(DATA_DIR, "IHME-GBD_2023_Appendicitis.csv"),
+  show_col_types = FALSE
+)
+
+raw_gb  <- readr::read_csv(
+  file.path(DATA_DIR, "IHME-GBD_2023_GB.csv"),
+  show_col_types = FALSE
+)
+
+raw_her <- readr::read_csv(
+  file.path(DATA_DIR, "IHME-GBD_2023_Hernia.csv"),
+  show_col_types = FALSE
+)
+
+cat("Rows loaded:\n")
+cat("  Appendicitis :", nrow(raw_app), "\n")
+cat("  Gallbladder  :", nrow(raw_gb),  "\n")
+cat("  Hernia       :", nrow(raw_her), "\n")
+
+cat("\nColumns:\n")
+print(names(raw_app))
+
+
+
+# ============================================================
+# SCRIPT 07 — BLOCK C: Clean and Standardise
+# Drop extra ID columns, enforce types, trim strings
+# ============================================================
+
+clean_regional <- function(df) {
+  
+  # Drop the two extra population columns (constant = "All Population")
+  df <- dplyr::select(df, -population_group_id, -population_group_name)
+  
+  # Drop numeric ID columns — names are sufficient for analysis
+  df <- dplyr::select(df, -measure_id, -sex_id, -age_id,
+                      -cause_id, -metric_id, -location_id)
+  
+  # Rename to clean short names
+  df <- dplyr::rename(df,
+                      location  = location_name,
+                      cause     = cause_name,
+                      measure   = measure_name,
+                      metric    = metric_name,
+                      sex       = sex_name,
+                      age_group = age_name
+  )
+  
+  # Trim whitespace on all character columns
+  df$location  <- trimws(df$location)
+  df$cause     <- trimws(df$cause)
+  df$measure   <- trimws(df$measure)
+  df$metric    <- trimws(df$metric)
+  df$sex       <- trimws(df$sex)
+  df$age_group <- trimws(df$age_group)
+  
+  # Enforce types
+  df$year  <- as.integer(df$year)
+  df$val   <- as.numeric(df$val)
+  df$upper <- as.numeric(df$upper)
+  df$lower <- as.numeric(df$lower)
+  
+  return(df)
+}
+
+app_clean <- clean_regional(raw_app)
+gb_clean  <- clean_regional(raw_gb)
+her_clean <- clean_regional(raw_her)
+
+cat("Columns after cleaning:\n")
+print(names(app_clean))
+
+cat("\nDistinct causes confirmed:\n")
+cat("  Appendicitis:", unique(app_clean$cause), "\n")
+cat("  Gallbladder :", unique(gb_clean$cause),  "\n")
+cat("  Hernia      :", unique(her_clean$cause),  "\n")
+
+
+# ============================================================
+# SCRIPT 07 — BLOCK D: Merge All Three Conditions
+# Expected total rows: 250,614 (83,538 x 3)
+# ============================================================
+
+regional_data <- dplyr::bind_rows(app_clean, gb_clean, her_clean)
+
+cat("Merged dataframe:", nrow(regional_data), "rows x",
+    ncol(regional_data), "cols\n")
+
+cat("\nConditions:\n")
+print(table(regional_data$cause))
+
+cat("\nMeasures:\n")
+print(table(regional_data$measure))
+
+cat("\nMetrics:\n")
+print(table(regional_data$metric))
+
+cat("\nSex categories:\n")
+print(table(regional_data$sex))
+
+cat("\nAge groups:\n")
+print(table(regional_data$age_group))
+
+cat("\nRegions (n =", length(unique(regional_data$location)), "):\n")
+print(sort(unique(regional_data$location)))
+
+cat("\nYear range:", min(regional_data$year),
+    "to", max(regional_data$year), "\n")
+
+cat("\nMissing values:\n")
+cat("  val   :", sum(is.na(regional_data$val)),   "\n")
+cat("  upper :", sum(is.na(regional_data$upper)), "\n")
+cat("  lower :", sum(is.na(regional_data$lower)), "\n")
+
+
+# ============================================================
+# SCRIPT 07 — BLOCK E: Create Analysis Subsets + Save RDS
+# ============================================================
+
+# Age-standardized rates — for EAPC and trend analysis
+regional_asr <- regional_data |>
+  dplyr::filter(age_group == "Age-standardized", metric == "Rate")
+
+# All-ages counts — for descriptive burden tables
+regional_counts <- regional_data |>
+  dplyr::filter(age_group == "All ages", metric == "Number")
+
+# All-ages rates — supplementary descriptive
+regional_allages_rate <- regional_data |>
+  dplyr::filter(age_group == "All ages", metric == "Rate")
+
+# Both sexes combined — primary analytical tier
+regional_asr_both <- regional_asr |>
+  dplyr::filter(sex == "Both")
+
+regional_counts_both <- regional_counts |>
+  dplyr::filter(sex == "Both")
+
+# Sex-disaggregated — secondary tier
+regional_asr_sex <- regional_asr |>
+  dplyr::filter(sex %in% c("Male", "Female"))
+
+regional_counts_sex <- regional_counts |>
+  dplyr::filter(sex %in% c("Male", "Female"))
+
+# Verify subset sizes
+cat("Subset row counts:\n")
+cat("  regional_asr (all sexes, ASR Rate)  :", nrow(regional_asr),          "\n")
+cat("  regional_counts (all sexes, Number) :", nrow(regional_counts),        "\n")
+cat("  regional_asr_both                   :", nrow(regional_asr_both),      "\n")
+cat("  regional_counts_both                :", nrow(regional_counts_both),   "\n")
+cat("  regional_asr_sex                    :", nrow(regional_asr_sex),       "\n")
+cat("  regional_counts_sex                 :", nrow(regional_counts_sex),    "\n")
+
+# Save all objects
+saveRDS(regional_data,
+        file.path(OUTPUT_DIR, "S07_regional_data_full.rds"))
+saveRDS(regional_asr,
+        file.path(OUTPUT_DIR, "S07_regional_asr.rds"))
+saveRDS(regional_counts,
+        file.path(OUTPUT_DIR, "S07_regional_counts.rds"))
+saveRDS(regional_allages_rate,
+        file.path(OUTPUT_DIR, "S07_regional_allages_rate.rds"))
+saveRDS(regional_asr_both,
+        file.path(OUTPUT_DIR, "S07_regional_asr_both.rds"))
+saveRDS(regional_counts_both,
+        file.path(OUTPUT_DIR, "S07_regional_counts_both.rds"))
+saveRDS(regional_asr_sex,
+        file.path(OUTPUT_DIR, "S07_regional_asr_sex.rds"))
+saveRDS(regional_counts_sex,
+        file.path(OUTPUT_DIR, "S07_regional_counts_sex.rds"))
+
+cat("\n✅ Script 07 complete. All RDS files saved to:\n")
+cat(OUTPUT_DIR, "\n")
+
+
+
+
+# ============================================================
+# SCRIPT 08 — BLOCK A: Load Environment from Script 07
+# ============================================================
+
+library(dplyr)
+library(openxlsx)
+library(segmented)  # keeps MASS loaded — use dplyr:: throughout
+
+OUTPUT_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_GBDregions/outputs/"
+
+# Reload RDS objects saved in Script 07
+regional_counts_both  <- readRDS(file.path(OUTPUT_DIR, "S07_regional_counts_both.rds"))
+regional_allages_rate <- readRDS(file.path(OUTPUT_DIR, "S07_regional_allages_rate.rds"))
+regional_asr_both     <- readRDS(file.path(OUTPUT_DIR, "S07_regional_asr_both.rds"))
+regional_counts_sex   <- readRDS(file.path(OUTPUT_DIR, "S07_regional_counts_sex.rds"))
+regional_asr_sex      <- readRDS(file.path(OUTPUT_DIR, "S07_regional_asr_sex.rds"))
+
+cat("Objects loaded successfully.\n")
+cat("  regional_counts_both  :", nrow(regional_counts_both),  "rows\n")
+cat("  regional_allages_rate :", nrow(regional_allages_rate), "rows\n")
+cat("  regional_asr_both     :", nrow(regional_asr_both),     "rows\n")
+cat("  regional_counts_sex   :", nrow(regional_counts_sex),   "rows\n")
+cat("  regional_asr_sex      :", nrow(regional_asr_sex),      "rows\n")
+
+
+# ============================================================
+# SCRIPT 08 — BLOCK B: Helper Functions
+# ============================================================
+
+# Format number with thousand separator, 1 decimal
+fmt_num <- function(x) formatC(round(x, 1), format = "f", digits = 1, big.mark = ",")
+
+# Format rate to 2 decimal places
+fmt_rate <- function(x) formatC(round(x, 2), format = "f", digits = 2)
+
+# Format percent change
+fmt_pct <- function(x) paste0(ifelse(x >= 0, "+", ""), round(x, 1), "%")
+
+# Extract 1990 and 2023 values and compute % change
+burden_change <- function(df, value_col = "val", ui_lo = "lower", ui_hi = "upper") {
+  y1990 <- dplyr::filter(df, year == 1990)
+  y2023 <- dplyr::filter(df, year == 2023)
+  merged <- dplyr::inner_join(
+    dplyr::select(y1990, location, cause, measure, sex,
+                  val_1990 = !!sym(value_col),
+                  lo_1990  = !!sym(ui_lo),
+                  hi_1990  = !!sym(ui_hi)),
+    dplyr::select(y2023, location, cause, measure, sex,
+                  val_2023 = !!sym(value_col),
+                  lo_2023  = !!sym(ui_lo),
+                  hi_2023  = !!sym(ui_hi)),
+    by = c("location", "cause", "measure", "sex")
+  )
+  merged <- dplyr::mutate(merged,
+                          pct_change = ((val_2023 - val_1990) / val_1990) * 100
+  )
+  return(merged)
+}
+
+cat("Helper functions defined.\n")
+
+
+
+# ============================================================
+# SCRIPT 08 — BLOCK C: Table 1 — Regional Absolute Counts
+# All-ages Number, Both sexes, 1990 vs 2023, % change
+# One row per region × condition × measure
+# ============================================================
+
+counts_change <- burden_change(regional_counts_both)
+
+table1 <- counts_change |>
+  dplyr::mutate(
+    `1990 Count (95% UI)`  = paste0(fmt_num(val_1990),
+                                    " (", fmt_num(lo_1990),
+                                    "–",  fmt_num(hi_1990), ")"),
+    `2023 Count (95% UI)`  = paste0(fmt_num(val_2023),
+                                    " (", fmt_num(lo_2023),
+                                    "–",  fmt_num(hi_2023), ")"),
+    `% Change`             = fmt_pct(pct_change)
+  ) |>
+  dplyr::select(
+    Region    = location,
+    Condition = cause,
+    Measure   = measure,
+    `1990 Count (95% UI)`,
+    `2023 Count (95% UI)`,
+    `% Change`
+  ) |>
+  dplyr::arrange(Condition, Measure, Region) |>
+  as.data.frame()
+
+cat("Table 1 dimensions:", nrow(table1), "rows x", ncol(table1), "cols\n")
+cat("Preview:\n")
+print(head(table1, 6))
+
+
+
+# ============================================================
+# SCRIPT 08 — BLOCK D: Table 2 — Regional Age-Standardized Rates
+# ASR Rate, Both sexes, 1990 vs 2023, % change
+# ============================================================
+
+asr_change <- burden_change(regional_asr_both)
+
+table2 <- asr_change |>
+  dplyr::mutate(
+    `1990 ASR (95% UI)` = paste0(fmt_rate(val_1990),
+                                 " (", fmt_rate(lo_1990),
+                                 "–",  fmt_rate(hi_1990), ")"),
+    `2023 ASR (95% UI)` = paste0(fmt_rate(val_2023),
+                                 " (", fmt_rate(lo_2023),
+                                 "–",  fmt_rate(hi_2023), ")"),
+    `% Change`          = fmt_pct(pct_change)
+  ) |>
+  dplyr::select(
+    Region    = location,
+    Condition = cause,
+    Measure   = measure,
+    `1990 ASR (95% UI)`,
+    `2023 ASR (95% UI)`,
+    `% Change`
+  ) |>
+  dplyr::arrange(Condition, Measure, Region) |>
+  as.data.frame()
+
+cat("Table 2 dimensions:", nrow(table2), "rows x", ncol(table2), "cols\n")
+cat("Preview:\n")
+print(head(table2, 6))
+
+
+
+# ============================================================
+# SCRIPT 08 — BLOCK E: Table 3 — Sex-Disaggregated ASR
+# Male vs Female, 1990 and 2023 ASR, % change
+# ============================================================
+
+asr_sex_change <- burden_change(regional_asr_sex)
+
+table3 <- asr_sex_change |>
+  dplyr::mutate(
+    `1990 ASR (95% UI)` = paste0(fmt_rate(val_1990),
+                                 " (", fmt_rate(lo_1990),
+                                 "–",  fmt_rate(hi_1990), ")"),
+    `2023 ASR (95% UI)` = paste0(fmt_rate(val_2023),
+                                 " (", fmt_rate(lo_2023),
+                                 "–",  fmt_rate(hi_2023), ")"),
+    `% Change`          = fmt_pct(pct_change)
+  ) |>
+  dplyr::select(
+    Region    = location,
+    Condition = cause,
+    Measure   = measure,
+    Sex       = sex,
+    `1990 ASR (95% UI)`,
+    `2023 ASR (95% UI)`,
+    `% Change`
+  ) |>
+  dplyr::arrange(Condition, Measure, Sex, Region) |>
+  as.data.frame()
+
+cat("Table 3 dimensions:", nrow(table3), "rows x", ncol(table3), "cols\n")
+cat("Preview:\n")
+print(head(table3, 6))
+
+
+# ============================================================
+# SCRIPT 08 — BLOCK F: Table 4 — Sex-Disaggregated Counts
+# Male vs Female, All-ages Number, 1990 and 2023
+# ============================================================
+
+counts_sex_change <- burden_change(regional_counts_sex)
+
+table4 <- counts_sex_change |>
+  dplyr::mutate(
+    `1990 Count (95% UI)` = paste0(fmt_num(val_1990),
+                                   " (", fmt_num(lo_1990),
+                                   "–",  fmt_num(hi_1990), ")"),
+    `2023 Count (95% UI)` = paste0(fmt_num(val_2023),
+                                   " (", fmt_num(lo_2023),
+                                   "–",  fmt_num(hi_2023), ")"),
+    `% Change`            = fmt_pct(pct_change)
+  ) |>
+  dplyr::select(
+    Region    = location,
+    Condition = cause,
+    Measure   = measure,
+    Sex       = sex,
+    `1990 Count (95% UI)`,
+    `2023 Count (95% UI)`,
+    `% Change`
+  ) |>
+  dplyr::arrange(Condition, Measure, Sex, Region) |>
+  as.data.frame()
+
+cat("Table 4 dimensions:", nrow(table4), "rows x", ncol(table4), "cols\n")
+cat("Preview:\n")
+print(head(table4, 6))
+
+
+
+
+# ============================================================
+# SCRIPT 08 — BLOCK G: Write All Tables to Excel
+# ============================================================
+
+wb8 <- createWorkbook()
+
+# Style definitions
+hdr_style <- createStyle(
+  fontName     = "Calibri", fontSize = 11, fontColour = "white",
+  fgFill       = "#2E4057", halign = "center", valign = "center",
+  textDecoration = "bold", wrapText = TRUE, border = "TopBottomLeftRight",
+  borderColour = "#2E4057"
+)
+body_style <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign   = "center", border = "TopBottomLeftRight",
+  borderColour = "#D0D0D0"
+)
+alt_style <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign   = "center", fgFill = "#F5F8FA",
+  border   = "TopBottomLeftRight", borderColour = "#D0D0D0"
+)
+
+
+write_sheet <- function(wb, sheet_name, df, col_widths) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, as.data.frame(df), headerStyle = hdr_style,
+            borders = "all", borderStyle = "thin")
+  nr <- nrow(df)
+  nc <- ncol(df)
+  # Alternate row shading
+  for (i in seq(2, nr + 1, by = 2)) {
+    addStyle(wb, sheet_name, alt_style,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  for (i in seq(1, nr, by = 2)) {
+    addStyle(wb, sheet_name, body_style,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  setColWidths(wb, sheet_name, cols = 1:nc, widths = col_widths)
+  setRowHeights(wb, sheet_name, rows = 1, heights = 30)
+}
+
+# Table 1 — Regional Counts (Both)
+write_sheet(wb8, "T1_RegionalCounts_Both", table1,
+            col_widths = c(28, 38, 35, 32, 32, 12))
+
+# Table 2 — Regional ASR (Both)
+write_sheet(wb8, "T2_RegionalASR_Both", table2,
+            col_widths = c(28, 38, 35, 28, 28, 12))
+
+# Table 3 — Sex-disaggregated ASR
+write_sheet(wb8, "T3_RegionalASR_Sex", table3,
+            col_widths = c(28, 38, 35, 10, 28, 28, 12))
+
+# Table 4 — Sex-disaggregated Counts
+write_sheet(wb8, "T4_RegionalCounts_Sex", table4,
+            col_widths = c(28, 38, 35, 10, 32, 32, 12))
+
+out_file8 <- file.path(OUTPUT_DIR, "S08_Regional_Descriptive_Tables.xlsx")
+saveWorkbook(wb8, out_file8, overwrite = TRUE)
+
+# Save RDS checkpoint
+saveRDS(list(table1 = table1, table2 = table2,
+             table3 = table3, table4 = table4),
+        file.path(OUTPUT_DIR, "S08_descriptive_tables.rds"))
+
+cat("✅ Script 08 complete.\n")
+cat("Excel saved to:", out_file8, "\n")
+
+# ============================================================
+# SCRIPT 09 — BLOCK A: Load Environment
+# ============================================================
+
+library(dplyr)
+library(segmented)   # loads MASS — dplyr:: namespace required throughout
+library(openxlsx)
+
+OUTPUT_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_GBDregions/outputs/"
+
+regional_asr_both <- readRDS(file.path(OUTPUT_DIR, "S07_regional_asr_both.rds"))
+regional_asr_sex  <- readRDS(file.path(OUTPUT_DIR, "S07_regional_asr_sex.rds"))
+
+cat("Loaded:\n")
+cat("  regional_asr_both :", nrow(regional_asr_both), "rows\n")
+cat("  regional_asr_sex  :", nrow(regional_asr_sex),  "rows\n")
+cat("  Conditions        :", paste(unique(regional_asr_both$cause), collapse = " | "), "\n")
+cat("  Measures          :", paste(unique(regional_asr_both$measure), collapse = " | "), "\n")
+cat("  Regions (n)       :", length(unique(regional_asr_both$location)), "\n")
+
+
+# ============================================================
+# SCRIPT 09 — BLOCK B: EAPC Core Functions
+# Log-linear regression for overall EAPC
+# Segmented joinpoint for trend change detection
+# ============================================================
+
+# --- Overall EAPC via log-linear regression ---
+calc_eapc <- function(years, rates) {
+  tryCatch({
+    if (any(is.na(rates)) || any(rates <= 0) || length(rates) < 5) {
+      return(list(eapc = NA, ci_lo = NA, ci_hi = NA, pval = NA, r2 = NA))
+    }
+    ln_rates <- log(rates)
+    fit      <- lm(ln_rates ~ years)
+    beta     <- coef(fit)["years"]
+    se       <- summary(fit)$coefficients["years", "Std. Error"]
+    eapc     <- (exp(beta) - 1) * 100
+    ci_lo    <- (exp(beta - 1.96 * se) - 1) * 100
+    ci_hi    <- (exp(beta + 1.96 * se) - 1) * 100
+    pval     <- summary(fit)$coefficients["years", "Pr(>|t|)"]
+    r2       <- summary(fit)$r.squared
+    list(eapc = eapc, ci_lo = ci_lo, ci_hi = ci_hi, pval = pval, r2 = r2)
+  }, error = function(e) {
+    list(eapc = NA, ci_lo = NA, ci_hi = NA, pval = NA, r2 = NA)
+  })
+}
+
+# --- Joinpoint via segmented package ---
+calc_joinpoint <- function(years, rates) {
+  tryCatch({
+    if (any(is.na(rates)) || any(rates <= 0) || length(rates) < 10) {
+      return(list(n_joinpoints = 0, joinpoint_years = NA,
+                  segment_eapcs = NA, segment_cis = NA))
+    }
+    ln_rates <- log(rates)
+    fit_lm   <- lm(ln_rates ~ years)
+    fit_seg  <- segmented::segmented(fit_lm,
+                                     seg.Z = ~years,
+                                     npsi  = 1,
+                                     control = segmented::seg.control(
+                                       it.max = 100, tol = 1e-5, seed = 42))
+    bp       <- fit_seg$psi[, "Est."]
+    bp_year  <- round(bp)
+    
+    # Extract slopes per segment
+    slopes   <- segmented::slope(fit_seg)$years
+    n_seg    <- nrow(slopes)
+    seg_eapc <- round((exp(slopes[, "Est."]) - 1) * 100, 2)
+    seg_lo   <- round((exp(slopes[, "Est."] - 1.96 * slopes[, "Std. Error"]) - 1) * 100, 2)
+    seg_hi   <- round((exp(slopes[, "Est."] + 1.96 * slopes[, "Std. Error"]) - 1) * 100, 2)
+    
+    seg_str  <- paste0(seg_eapc, "% (", seg_lo, "–", seg_hi, ")",
+                       collapse = "; ")
+    
+    list(n_joinpoints    = length(bp_year),
+         joinpoint_years = paste(bp_year, collapse = ", "),
+         segment_eapcs   = seg_str,
+         segment_cis     = NA)
+  }, error = function(e) {
+    list(n_joinpoints = 0, joinpoint_years = NA,
+         segment_eapcs = NA, segment_cis = NA)
+  })
+}
+
+# --- Format helpers ---
+fmt_eapc <- function(e, lo, hi) {
+  if (is.na(e)) return(NA_character_)
+  paste0(round(e, 2), "% (", round(lo, 2), "–", round(hi, 2), "%)")
+}
+
+fmt_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  formatC(p, format = "f", digits = 3)
+}
+
+cat("EAPC functions defined.\n")
+
+
+
+# ============================================================
+# SCRIPT 09 — BLOCK C: EAPC — Both Sexes Combined
+# 21 regions × 3 conditions × 3 measures = 189 combinations
+# ============================================================
+
+groups_both <- regional_asr_both |>
+  dplyr::group_by(location, cause, measure) |>
+  dplyr::group_split()
+
+cat("Number of groups (both sexes):", length(groups_both), "\n")
+
+eapc_both_list <- lapply(groups_both, function(s) {
+  s       <- s[order(s$year), ]
+  loc     <- as.character(s$location[1])
+  cond    <- as.character(s$cause[1])
+  meas    <- as.character(s$measure[1])
+  
+  # Overall EAPC
+  res     <- calc_eapc(s$year, s$val)
+  
+  # Joinpoint
+  jp      <- calc_joinpoint(s$year, s$val)
+  
+  data.frame(
+    Location         = loc,
+    Condition        = cond,
+    Measure          = meas,
+    Sex              = "Both",
+    EAPC             = res$eapc,
+    CI_lo            = res$ci_lo,
+    CI_hi            = res$ci_hi,
+    P_value          = res$pval,
+    R2               = res$r2,
+    N_joinpoints     = jp$n_joinpoints,
+    Joinpoint_years  = jp$joinpoint_years,
+    Segment_EAPCs    = jp$segment_eapcs,
+    stringsAsFactors = FALSE
+  )
+})
+
+eapc_both <- do.call(rbind, eapc_both_list)
+eapc_both <- as.data.frame(eapc_both)
+
+cat("EAPC both sexes computed:", nrow(eapc_both), "rows\n")
+cat("NA in EAPC:", sum(is.na(eapc_both$EAPC)), "\n")
+print(head(eapc_both, 4))
+
+
+
+# ============================================================
+# SCRIPT 09 — BLOCK D: EAPC — Sex-Disaggregated
+# 21 regions × 3 conditions × 3 measures × 2 sexes = 378
+# ============================================================
+
+groups_sex <- regional_asr_sex |>
+  dplyr::group_by(location, cause, measure, sex) |>
+  dplyr::group_split()
+
+cat("Number of groups (sex-disaggregated):", length(groups_sex), "\n")
+
+eapc_sex_list <- lapply(groups_sex, function(s) {
+  s       <- s[order(s$year), ]
+  loc     <- as.character(s$location[1])
+  cond    <- as.character(s$cause[1])
+  meas    <- as.character(s$measure[1])
+  sx      <- as.character(s$sex[1])
+  
+  res     <- calc_eapc(s$year, s$val)
+  jp      <- calc_joinpoint(s$year, s$val)
+  
+  data.frame(
+    Location         = loc,
+    Condition        = cond,
+    Measure          = meas,
+    Sex              = sx,
+    EAPC             = res$eapc,
+    CI_lo            = res$ci_lo,
+    CI_hi            = res$ci_hi,
+    P_value          = res$pval,
+    R2               = res$r2,
+    N_joinpoints     = jp$n_joinpoints,
+    Joinpoint_years  = jp$joinpoint_years,
+    Segment_EAPCs    = jp$segment_eapcs,
+    stringsAsFactors = FALSE
+  )
+})
+
+eapc_sex <- do.call(rbind, eapc_sex_list)
+eapc_sex <- as.data.frame(eapc_sex)
+
+cat("EAPC sex-disaggregated computed:", nrow(eapc_sex), "rows\n")
+cat("NA in EAPC:", sum(is.na(eapc_sex$EAPC)), "\n")
+print(head(eapc_sex, 4))
+
+
+# ============================================================
+# SCRIPT 09 — BLOCK E: Format Publication-Ready EAPC Table
+# ============================================================
+
+format_eapc_table <- function(df) {
+  df <- dplyr::mutate(df,
+                      `EAPC (95% CI)`     = mapply(fmt_eapc, EAPC, CI_lo, CI_hi),
+                      `P-value`           = sapply(P_value, fmt_p),
+                      `R²`                = ifelse(is.na(R2), NA_character_,
+                                                   formatC(round(R2, 3), format = "f", digits = 3)),
+                      `Joinpoint Year(s)` = ifelse(is.na(Joinpoint_years), "None", Joinpoint_years),
+                      `Segment EAPC(s)`   = ifelse(is.na(Segment_EAPCs),  "—",    Segment_EAPCs),
+                      Trend               = dplyr::case_when(
+                        is.na(EAPC)         ~ "Undetermined",
+                        P_value >= 0.05     ~ "Stable",
+                        EAPC > 0            ~ "Increasing",
+                        TRUE                ~ "Decreasing"
+                      )
+  ) |>
+    dplyr::select(
+      Location, Condition, Measure, Sex,
+      `EAPC (95% CI)`, `P-value`, `R²`, Trend,
+      `Joinpoint Year(s)`, `Segment EAPC(s)`
+    ) |>
+    dplyr::arrange(Condition, Measure, Sex, Location) |>
+    as.data.frame()
+  return(df)
+}
+
+eapc_both_fmt <- format_eapc_table(eapc_both)
+eapc_sex_fmt  <- format_eapc_table(eapc_sex)
+
+cat("Formatted both-sex table:", nrow(eapc_both_fmt), "rows\n")
+cat("Formatted sex-disagg table:", nrow(eapc_sex_fmt), "rows\n")
+
+# Trend distribution
+cat("\nTrend summary — Both sexes:\n")
+print(table(eapc_both_fmt$Condition, eapc_both_fmt$Trend))
+
+
+
+# ============================================================
+# SCRIPT 09 — BLOCK F: Write Excel + Save RDS
+# ============================================================
+
+wb9 <- createWorkbook()
+
+hdr9 <- createStyle(
+  fontName = "Calibri", fontSize = 11, fontColour = "white",
+  fgFill   = "#1B4332", halign = "center", valign = "center",
+  textDecoration = "bold", wrapText = TRUE,
+  border = "TopBottomLeftRight", borderColour = "#1B4332"
+)
+body9 <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign = "center", border = "TopBottomLeftRight",
+  borderColour = "#D0D0D0"
+)
+alt9 <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign = "center", fgFill = "#F0F7F4",
+  border = "TopBottomLeftRight", borderColour = "#D0D0D0"
+)
+inc9 <- createStyle(fontColour = "#C0392B", textDecoration = "bold")
+dec9 <- createStyle(fontColour = "#1A7340", textDecoration = "bold")
+sta9 <- createStyle(fontColour = "#7D6608")
+
+write_eapc_sheet <- function(wb, sheet_name, df, col_w) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, as.data.frame(df),
+            headerStyle = hdr9, borders = "all", borderStyle = "thin")
+  nr <- nrow(df)
+  nc <- ncol(df)
+  for (i in seq(2, nr + 1, by = 2)) {
+    addStyle(wb, sheet_name, alt9,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  for (i in seq(1, nr, by = 2)) {
+    addStyle(wb, sheet_name, body9,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  # Colour-code Trend column (col 8)
+  trend_col <- which(names(df) == "Trend")
+  for (i in 1:nr) {
+    tr <- df$Trend[i]
+    if (!is.na(tr)) {
+      sty <- if (tr == "Increasing") inc9 else if (tr == "Decreasing") dec9 else sta9
+      addStyle(wb, sheet_name, sty, rows = i + 1,
+               cols = trend_col, stack = TRUE)
+    }
+  }
+  setColWidths(wb, sheet_name, cols = 1:nc, widths = col_w)
+  setRowHeights(wb, sheet_name, rows = 1, heights = 32)
+}
+
+w_both <- c(28, 38, 35, 8, 28, 10, 8, 14, 18, 35)
+w_sex  <- c(28, 38, 35, 8, 28, 10, 8, 14, 18, 35)
+
+write_eapc_sheet(wb9, "EAPC_Both_Sexes",      eapc_both_fmt, w_both)
+write_eapc_sheet(wb9, "EAPC_Sex_Disaggregated", eapc_sex_fmt, w_sex)
+
+out_file9 <- file.path(OUTPUT_DIR, "S09_Regional_EAPC_Tables.xlsx")
+saveWorkbook(wb9, out_file9, overwrite = TRUE)
+
+saveRDS(list(eapc_both     = eapc_both,
+             eapc_sex      = eapc_sex,
+             eapc_both_fmt = eapc_both_fmt,
+             eapc_sex_fmt  = eapc_sex_fmt),
+        file.path(OUTPUT_DIR, "S09_eapc_results.rds"))
+
+cat("✅ Script 09 complete.\n")
+cat("Excel saved to:", out_file9, "\n")
+
+
+
+
+
+# ============================================================
+# SCRIPT 10 — BLOCK A: Load Environment
+# ============================================================
+
+library(dplyr)
+library(forecast)
+library(tseries)
+library(segmented)   # keeps MASS loaded — dplyr:: namespace required
+library(openxlsx)
+
+OUTPUT_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_GBDregions/outputs/"
+
+regional_asr_both <- readRDS(file.path(OUTPUT_DIR, "S07_regional_asr_both.rds"))
+
+cat("Loaded:\n")
+cat("  regional_asr_both :", nrow(regional_asr_both), "rows\n")
+cat("  Regions           :", length(unique(regional_asr_both$location)), "\n")
+cat("  Conditions        :", length(unique(regional_asr_both$cause)), "\n")
+cat("  Measures          :", length(unique(regional_asr_both$measure)), "\n")
+cat("  Expected groups   : 189 (21 × 3 × 3)\n")
+
+
+
+# ============================================================
+# SCRIPT 10 — BLOCK B: ARIMA Core Functions
+# AICc model selection, hold-out validation 2019-2023,
+# forecast 2024-2035 with 95% PI
+# ============================================================
+
+run_arima_forecast <- function(years, rates, loc, cond, meas) {
+  
+  tryCatch({
+    
+    if (length(rates) < 10 || any(is.na(rates)) || any(rates <= 0)) {
+      return(NULL)
+    }
+    
+    # --- Split: training 1990-2018, hold-out 2019-2023 ---
+    train_idx  <- years <= 2018
+    holdout_idx <- years >= 2019 & years <= 2023
+    
+    train_rates   <- rates[train_idx]
+    train_years   <- years[train_idx]
+    holdout_rates <- rates[holdout_idx]
+    holdout_years <- years[holdout_idx]
+    
+    # --- Fit ARIMA on training set (AICc selection) ---
+    ts_train <- ts(train_rates, start = min(train_years), frequency = 1)
+    fit      <- forecast::auto.arima(ts_train, ic = "aicc",
+                                     stepwise = FALSE, approximation = FALSE)
+    
+    # --- Validation: forecast 5 steps ahead (2019-2023) ---
+    fc_holdout <- forecast::forecast(fit, h = 5, level = 95)
+    val_pred   <- as.numeric(fc_holdout$mean)
+    val_lo     <- as.numeric(fc_holdout$lower[, 1])
+    val_hi     <- as.numeric(fc_holdout$upper[, 1])
+    
+    # Validation metrics
+    mae  <- mean(abs(holdout_rates - val_pred))
+    rmse <- sqrt(mean((holdout_rates - val_pred)^2))
+    mape <- mean(abs((holdout_rates - val_pred) / holdout_rates)) * 100
+    coverage <- mean(holdout_rates >= val_lo & holdout_rates <= val_hi) * 100
+    
+    # --- Refit on full 1990-2023 for final forecast ---
+    ts_full  <- ts(rates, start = min(years), frequency = 1)
+    fit_full <- forecast::auto.arima(ts_full, ic = "aicc",
+                                     stepwise = FALSE, approximation = FALSE)
+    fc_full  <- forecast::forecast(fit_full, h = 12, level = 95)
+    
+    forecast_years <- 2024:2035
+    fc_mean <- as.numeric(fc_full$mean)
+    fc_lo   <- as.numeric(fc_full$lower[, 1])
+    fc_hi   <- as.numeric(fc_full$upper[, 1])
+    
+    model_order <- paste0("ARIMA(",
+                          paste(arimaorder(fit_full), collapse = ","), ")")
+    
+    # --- Assemble validation summary row ---
+    val_df <- data.frame(
+      Location    = loc,
+      Condition   = cond,
+      Measure     = meas,
+      Model       = model_order,
+      AICc        = round(fit_full$aicc, 2),
+      MAE         = round(mae, 4),
+      RMSE        = round(rmse, 4),
+      MAPE        = round(mape, 2),
+      Coverage_95 = round(coverage, 1),
+      stringsAsFactors = FALSE
+    )
+    
+    # --- Assemble forecast rows ---
+    fc_df <- data.frame(
+      Location      = loc,
+      Condition     = cond,
+      Measure       = meas,
+      Year          = forecast_years,
+      Forecast      = round(fc_mean, 4),
+      PI_lower_95   = round(fc_lo,   4),
+      PI_upper_95   = round(fc_hi,   4),
+      stringsAsFactors = FALSE
+    )
+    
+    list(validation = val_df, forecast = fc_df)
+    
+  }, error = function(e) {
+    message("ARIMA failed: ", loc, " | ", cond, " | ", meas, " — ", e$message)
+    NULL
+  })
+}
+
+cat("ARIMA functions defined.\n")
+
+
+
+# ============================================================
+# SCRIPT 10 — BLOCK C: Run ARIMA Across All Groups
+# 21 regions × 3 conditions × 3 measures = 189 models
+# lapply + group_split — no group_modify
+# ============================================================
+
+groups_asr <- regional_asr_both |>
+  dplyr::group_by(location, cause, measure) |>
+  dplyr::group_split()
+
+cat("Groups to model:", length(groups_asr), "\n")
+cat("Running ARIMA — this may take 2-4 minutes...\n")
+
+arima_results <- lapply(groups_asr, function(s) {
+  s    <- s[order(s$year), ]
+  loc  <- as.character(s$location[1])
+  cond <- as.character(s$cause[1])
+  meas <- as.character(s$measure[1])
+  run_arima_forecast(s$year, s$val, loc, cond, meas)
+})
+
+# Remove any NULL results
+arima_results_clean <- Filter(Negate(is.null), arima_results)
+cat("Successful models:", length(arima_results_clean),
+    "out of", length(groups_asr), "\n")
+
+# Separate validation and forecast
+val_list <- lapply(arima_results_clean, `[[`, "validation")
+fc_list  <- lapply(arima_results_clean, `[[`, "forecast")
+
+arima_validation <- as.data.frame(do.call(rbind, val_list))
+arima_forecast   <- as.data.frame(do.call(rbind, fc_list))
+
+cat("\nValidation table:", nrow(arima_validation), "rows\n")
+cat("Forecast table  :", nrow(arima_forecast),   "rows\n")
+
+cat("\nValidation summary (first 6 rows):\n")
+print(head(arima_validation))
+
+cat("\nForecast coverage check:\n")
+cat("  Years covered:", paste(range(arima_forecast$Year), collapse = "–"), "\n")
+cat("  NA in Forecast:", sum(is.na(arima_forecast$Forecast)), "\n")
+
+
+
+# ============================================================
+# SCRIPT 10 — BLOCK D: Validation Diagnostics Summary
+# ============================================================
+
+cat("=== ARIMA Validation Diagnostics ===\n\n")
+
+cat("MAPE summary (%):\n")
+print(summary(arima_validation$MAPE))
+
+cat("\nRMSE summary:\n")
+print(summary(arima_validation$RMSE))
+
+cat("\n95% PI Coverage summary (%):\n")
+print(summary(arima_validation$Coverage_95))
+
+cat("\nModel types used:\n")
+print(sort(table(arima_validation$Model), decreasing = TRUE))
+
+cat("\nMAPE by condition:\n")
+mape_cond <- arima_validation |>
+  dplyr::group_by(Condition) |>
+  dplyr::summarise(
+    Mean_MAPE   = round(mean(MAPE, na.rm = TRUE), 2),
+    Median_MAPE = round(median(MAPE, na.rm = TRUE), 2),
+    Max_MAPE    = round(max(MAPE, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) |>
+  as.data.frame()
+print(mape_cond)
+
+cat("\nMAPE by measure:\n")
+mape_meas <- arima_validation |>
+  dplyr::group_by(Measure) |>
+  dplyr::summarise(
+    Mean_MAPE   = round(mean(MAPE, na.rm = TRUE), 2),
+    Median_MAPE = round(median(MAPE, na.rm = TRUE), 2),
+    Max_MAPE    = round(max(MAPE, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) |>
+  as.data.frame()
+print(mape_meas)
+
+
+# ============================================================
+# SCRIPT 10 — BLOCK E: Format Publication Forecast Table
+# ============================================================
+
+fmt_fc <- function(x) formatC(round(x, 2), format = "f", digits = 2)
+
+forecast_table <- arima_forecast |>
+  dplyr::mutate(
+    `Forecast ASR (95% PI)` = paste0(fmt_fc(Forecast),
+                                     " (", fmt_fc(PI_lower_95),
+                                     "–",  fmt_fc(PI_upper_95), ")")
+  ) |>
+  dplyr::select(
+    Location, Condition, Measure, Year,
+    `Forecast ASR (95% PI)`,
+    Forecast, PI_lower_95, PI_upper_95
+  ) |>
+  dplyr::arrange(Condition, Measure, Location, Year) |>
+  as.data.frame()
+
+cat("Forecast table formatted:", nrow(forecast_table), "rows\n")
+print(head(forecast_table, 6))
+
+
+
+# ============================================================
+# SCRIPT 10 — BLOCK F: Write Excel + Save RDS
+# ============================================================
+
+wb10 <- createWorkbook()
+
+hdr10 <- createStyle(
+  fontName = "Calibri", fontSize = 11, fontColour = "white",
+  fgFill   = "#1C3557", halign = "center", valign = "center",
+  textDecoration = "bold", wrapText = TRUE,
+  border = "TopBottomLeftRight", borderColour = "#1C3557"
+)
+body10 <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign = "center", border = "TopBottomLeftRight",
+  borderColour = "#D0D0D0"
+)
+alt10 <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign = "center", fgFill = "#EEF2F7",
+  border = "TopBottomLeftRight", borderColour = "#D0D0D0"
+)
+
+write_sheet10 <- function(wb, sheet_name, df, col_w) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, as.data.frame(df),
+            headerStyle = hdr10, borders = "all", borderStyle = "thin")
+  nr <- nrow(df)
+  nc <- ncol(df)
+  for (i in seq(2, nr + 1, by = 2)) {
+    addStyle(wb, sheet_name, alt10,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  for (i in seq(1, nr, by = 2)) {
+    addStyle(wb, sheet_name, body10,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  setColWidths(wb, sheet_name, cols = 1:nc, widths = col_w)
+  setRowHeights(wb, sheet_name, rows = 1, heights = 32)
+}
+
+# Validation sheet
+write_sheet10(wb10, "ARIMA_Validation",
+              arima_validation,
+              col_w = c(28, 38, 35, 18, 10, 10, 10, 10, 14))
+
+# Forecast summary sheet (formatted)
+write_sheet10(wb10, "Forecast_2024_2035",
+              dplyr::select(forecast_table,
+                            Location, Condition, Measure, Year,
+                            `Forecast ASR (95% PI)`),
+              col_w = c(28, 38, 35, 8, 36))
+
+# Raw numeric forecast (for figures)
+write_sheet10(wb10, "Forecast_Raw_Numeric",
+              dplyr::select(forecast_table,
+                            Location, Condition, Measure, Year,
+                            Forecast, PI_lower_95, PI_upper_95),
+              col_w = c(28, 38, 35, 8, 14, 14, 14))
+
+out_file10 <- file.path(OUTPUT_DIR, "S10_Regional_ARIMA_Forecast.xlsx")
+saveWorkbook(wb10, out_file10, overwrite = TRUE)
+
+saveRDS(list(arima_validation = arima_validation,
+             arima_forecast   = arima_forecast,
+             forecast_table   = forecast_table),
+        file.path(OUTPUT_DIR, "S10_arima_results.rds"))
+
+cat("✅ Script 10 complete.\n")
+cat("Excel saved to:", out_file10, "\n")
+
+
+# ============================================================
+# SCRIPT 11 — BLOCK A: Load Environment
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(segmented)
+library(openxlsx)
+
+OUTPUT_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_GBDregions/outputs/"
+
+regional_asr_both <- readRDS(file.path(OUTPUT_DIR, "S07_regional_asr_both.rds"))
+eapc_data         <- readRDS(file.path(OUTPUT_DIR, "S09_eapc_results.rds"))
+arima_data        <- readRDS(file.path(OUTPUT_DIR, "S10_arima_results.rds"))
+
+eapc_both     <- eapc_data$eapc_both
+arima_forecast <- arima_data$arima_forecast
+
+cat("Loaded:\n")
+cat("  regional_asr_both :", nrow(regional_asr_both), "rows\n")
+cat("  eapc_both         :", nrow(eapc_both),         "rows\n")
+cat("  arima_forecast    :", nrow(arima_forecast),     "rows\n")
+
+# Shared plot theme
+theme_gbd <- theme_classic(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle   = element_text(size = 10, hjust = 0.5, colour = "grey40"),
+    axis.title      = element_text(size = 10, face = "bold"),
+    axis.text       = element_text(size = 9),
+    legend.position = "bottom",
+    legend.title    = element_text(size = 9, face = "bold"),
+    legend.text     = element_text(size = 8),
+    strip.text      = element_text(size = 9, face = "bold"),
+    panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.4),
+    plot.margin     = margin(10, 12, 10, 12)
+  )
+
+# Condition colour palette (consistent across all figures)
+cond_colours <- c(
+  "Appendicitis"                            = "#E63946",
+  "Gallbladder and biliary diseases"        = "#2196F3",
+  "Inguinal, femoral, and abdominal hernia" = "#4CAF50"
+)
+
+# Measure short labels
+measure_labels <- c(
+  "DALYs (Disability-Adjusted Life Years)" = "DALYs",
+  "Deaths"                                  = "Deaths",
+  "Incidence"                               = "Incidence"
+)
+
+cat("Theme and palettes defined.\n")
+
+
+
+# ============================================================
+# SCRIPT 11 — BLOCK B: Figure 1 — ASR Trend Lines by Region
+# One figure per condition, faceted by measure
+# ============================================================
+
+plot_trend_by_region <- function(condition_name, short_name) {
+  
+  df <- regional_asr_both |>
+    dplyr::filter(cause == condition_name,
+                  measure %in% names(measure_labels)) |>
+    dplyr::mutate(
+      Measure = dplyr::recode(measure, !!!measure_labels)
+    )
+  
+  p <- ggplot(df, aes(x = year, y = val, group = location, colour = location)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper, fill = location),
+                alpha = 0.07, colour = NA) +
+    geom_line(linewidth = 0.65, alpha = 0.85) +
+    facet_wrap(~Measure, scales = "free_y", ncol = 3) +
+    scale_x_continuous(breaks = c(1990, 2000, 2010, 2023),
+                       labels = c("1990", "2000", "2010", "2023")) +
+    scale_colour_manual(values = colorRampPalette(
+      c("#023E8A","#0096C7","#48CAE4","#52B788","#95D5B2",
+        "#F4A261","#E76F51","#C1121F","#9B2226","#6A0572",
+        "#3A0CA3","#7209B7","#B5179E","#F72585","#560BAD",
+        "#480CA8","#3F37C9","#4361EE","#4CC9F0","#06D6A0","#118AB2")
+    )(21)) +
+    scale_fill_manual(values = colorRampPalette(
+      c("#023E8A","#0096C7","#48CAE4","#52B788","#95D5B2",
+        "#F4A261","#E76F51","#C1121F","#9B2226","#6A0572",
+        "#3A0CA3","#7209B7","#B5179E","#F72585","#560BAD",
+        "#480CA8","#3F37C9","#4361EE","#4CC9F0","#06D6A0","#118AB2")
+    )(21)) +
+    labs(
+      title    = paste0("Age-Standardized Rate Trends by GBD Region\n", condition_name),
+      subtitle = "1990–2023 | GBD 2023 | Both Sexes Combined",
+      x        = "Year",
+      y        = "Age-Standardized Rate (per 100,000)",
+      colour   = "Region",
+      fill     = "Region"
+    ) +
+    theme_gbd +
+    theme(legend.position = "right",
+          legend.text     = element_text(size = 7),
+          legend.key.size = unit(0.5, "cm"))
+  
+  out <- file.path(OUTPUT_DIR,
+                   paste0("Fig1_TrendLines_", short_name, ".png"))
+  ggsave(out, plot = p, width = 16, height = 7, dpi = 300, bg = "white")
+  cat("Saved:", out, "\n")
+}
+
+plot_trend_by_region("Appendicitis",                            "Appendicitis")
+plot_trend_by_region("Gallbladder and biliary diseases",        "Gallbladder")
+plot_trend_by_region("Inguinal, femoral, and abdominal hernia", "Hernia")
+
+cat("Figure 1 (3 files) complete.\n")
+
+
+
+# ============================================================
+# SCRIPT 11 — BLOCK C: Figure 2 — EAPC Forest Plots
+# One plot per condition, faceted by measure
+# Colour-coded by direction: decreasing=green, increasing=red
+# ============================================================
+
+plot_eapc_forest <- function(condition_name, short_name) {
+  
+  df <- eapc_both |>
+    dplyr::filter(Condition == condition_name) |>
+    dplyr::mutate(
+      Measure  = dplyr::recode(Measure, !!!measure_labels),
+      Trend    = dplyr::case_when(
+        P_value >= 0.05 ~ "Stable",
+        EAPC > 0        ~ "Increasing",
+        TRUE            ~ "Decreasing"
+      ),
+      Location = factor(Location,
+                        levels = rev(sort(unique(Location))))
+    )
+  
+  p <- ggplot(df, aes(x = EAPC, y = Location, colour = Trend)) +
+    geom_vline(xintercept = 0, linetype = "dashed",
+               colour = "grey50", linewidth = 0.5) +
+    geom_errorbarh(aes(xmin = CI_lo, xmax = CI_hi),
+                   height = 0.35, linewidth = 0.6, alpha = 0.7) +
+    geom_point(size = 2.8, shape = 18) +
+    facet_wrap(~Measure, ncol = 3, scales = "free_x") +
+    scale_colour_manual(values = c(
+      "Decreasing" = "#1A7340",
+      "Increasing" = "#C0392B",
+      "Stable"     = "#7D6608"
+    )) +
+    labs(
+      title    = paste0("EAPC Forest Plot by GBD Region\n", condition_name),
+      subtitle = "Age-Standardized Rate | 1990–2023 | GBD 2023 | Both Sexes",
+      x        = "EAPC (% per year) with 95% CI",
+      y        = NULL,
+      colour   = "Trend Direction"
+    ) +
+    theme_gbd +
+    theme(legend.position  = "bottom",
+          panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.3))
+  
+  out <- file.path(OUTPUT_DIR,
+                   paste0("Fig2_EAPC_Forest_", short_name, ".png"))
+  ggsave(out, plot = p, width = 16, height = 9, dpi = 300, bg = "white")
+  cat("Saved:", out, "\n")
+}
+
+plot_eapc_forest("Appendicitis",                            "Appendicitis")
+plot_eapc_forest("Gallbladder and biliary diseases",        "Gallbladder")
+plot_eapc_forest("Inguinal, femoral, and abdominal hernia", "Hernia")
+
+cat("Figure 2 (3 files) complete.\n")
+
+
+
+# ============================================================
+# SCRIPT 11 — BLOCK D: Figure 3 — ARIMA Forecast Plots
+# Observed 1990-2023 + Forecast 2024-2035
+# Shaded 95% PI, vertical line at 2023
+# ============================================================
+
+plot_forecast_by_region <- function(condition_name, short_name) {
+  
+  obs_df <- regional_asr_both |>
+    dplyr::filter(cause == condition_name) |>
+    dplyr::mutate(Measure = dplyr::recode(measure, !!!measure_labels),
+                  Type = "Observed")
+  
+  fc_df <- arima_forecast |>
+    dplyr::filter(Condition == condition_name) |>
+    dplyr::mutate(Measure = dplyr::recode(Measure, !!!measure_labels),
+                  Type = "Forecast")
+  
+  # 21 colours
+  region_cols <- setNames(
+    colorRampPalette(c(
+      "#023E8A","#0096C7","#48CAE4","#52B788","#95D5B2",
+      "#F4A261","#E76F51","#C1121F","#9B2226","#6A0572",
+      "#3A0CA3","#7209B7","#B5179E","#F72585","#560BAD",
+      "#480CA8","#3F37C9","#4361EE","#4CC9F0","#06D6A0","#118AB2"
+    ))(21),
+    sort(unique(obs_df$location))
+  )
+  
+  p <- ggplot() +
+    # Observed ribbon (95% UI)
+    geom_ribbon(data = obs_df,
+                aes(x = year, ymin = lower, ymax = upper,
+                    fill = location, group = location),
+                alpha = 0.06, colour = NA) +
+    # Observed line
+    geom_line(data = obs_df,
+              aes(x = year, y = val,
+                  colour = location, group = location),
+              linewidth = 0.6, alpha = 0.9) +
+    # Forecast ribbon (95% PI)
+    geom_ribbon(data = fc_df,
+                aes(x = Year, ymin = PI_lower_95, ymax = PI_upper_95,
+                    fill = Location, group = Location),
+                alpha = 0.12, colour = NA) +
+    # Forecast line (dashed)
+    geom_line(data = fc_df,
+              aes(x = Year, y = Forecast,
+                  colour = Location, group = Location),
+              linewidth = 0.6, linetype = "dashed", alpha = 0.9) +
+    # Vertical separator at 2023
+    geom_vline(xintercept = 2023.5, linetype = "dotted",
+               colour = "grey40", linewidth = 0.5) +
+    facet_wrap(~Measure, scales = "free_y", ncol = 3) +
+    scale_colour_manual(values = region_cols) +
+    scale_fill_manual(values = region_cols) +
+    scale_x_continuous(breaks = c(1990, 2000, 2010, 2023, 2030, 2035),
+                       labels = c("1990","2000","2010","2023","2030","2035")) +
+    labs(
+      title    = paste0("Observed Trends & ARIMA Forecast by GBD Region\n",
+                        condition_name),
+      subtitle = "Observed 1990–2023 (solid) | Forecast 2024–2035 (dashed) | 95% UI/PI shaded",
+      x        = "Year",
+      y        = "Age-Standardized Rate (per 100,000)",
+      colour   = "Region",
+      fill     = "Region"
+    ) +
+    theme_gbd +
+    theme(legend.position = "right",
+          legend.text     = element_text(size = 7),
+          legend.key.size = unit(0.5, "cm"))
+  
+  out <- file.path(OUTPUT_DIR,
+                   paste0("Fig3_Forecast_", short_name, ".png"))
+  ggsave(out, plot = p, width = 16, height = 7, dpi = 300, bg = "white")
+  cat("Saved:", out, "\n")
+}
+
+plot_forecast_by_region("Appendicitis",                            "Appendicitis")
+plot_forecast_by_region("Gallbladder and biliary diseases",        "Gallbladder")
+plot_forecast_by_region("Inguinal, femoral, and abdominal hernia", "Hernia")
+
+cat("Figure 3 (3 files) complete.\n")
+
+
+
+# ============================================================
+# SCRIPT 11 — BLOCK E: Figure 4 — EAPC Heatmap
+# Rows = Regions, Cols = Condition × Measure
+# Fill = EAPC value, diverging colour scale
+# ============================================================
+
+heat_df <- eapc_both |>
+  dplyr::mutate(
+    Measure   = dplyr::recode(Measure, !!!measure_labels),
+    Condition = dplyr::recode(Condition,
+                              "Gallbladder and biliary diseases"        = "Gallbladder",
+                              "Inguinal, femoral, and abdominal hernia" = "Hernia"
+    ),
+    Col_label = paste0(Condition, "\n", Measure)
+  )
+
+# Order regions by mean EAPC across all groups
+region_order <- heat_df |>
+  dplyr::group_by(Location) |>
+  dplyr::summarise(mean_eapc = mean(EAPC, na.rm = TRUE), .groups = "drop") |>
+  dplyr::arrange(mean_eapc) |>
+  dplyr::pull(Location)
+
+heat_df$Location  <- factor(heat_df$Location,  levels = region_order)
+
+# Fixed column order
+col_order <- c(
+  "Appendicitis\nDALYs",      "Appendicitis\nDeaths",      "Appendicitis\nIncidence",
+  "Gallbladder\nDALYs",       "Gallbladder\nDeaths",       "Gallbladder\nIncidence",
+  "Hernia\nDALYs",            "Hernia\nDeaths",             "Hernia\nIncidence"
+)
+heat_df$Col_label <- factor(heat_df$Col_label, levels = col_order)
+
+eapc_lim <- max(abs(heat_df$EAPC), na.rm = TRUE)
+
+p_heat <- ggplot(heat_df, aes(x = Col_label, y = Location, fill = EAPC)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = round(EAPC, 1)),
+            size = 2.8, colour = "white", fontface = "bold") +
+  scale_fill_gradient2(
+    low      = "#1A7340",
+    mid      = "white",
+    high     = "#C0392B",
+    midpoint = 0,
+    limits   = c(-eapc_lim, eapc_lim),
+    name     = "EAPC\n(% per year)"
+  ) +
+  labs(
+    title    = "EAPC Heatmap — All GBD Regions × Conditions × Measures",
+    subtitle = "Age-Standardized Rate | 1990–2023 | GBD 2023 | Both Sexes",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_gbd +
+  theme(
+    axis.text.x      = element_text(size = 8, angle = 30, hjust = 1),
+    axis.text.y      = element_text(size = 8),
+    legend.position  = "right",
+    panel.grid       = element_blank()
+  )
+
+out_heat <- file.path(OUTPUT_DIR, "Fig4_EAPC_Heatmap_AllRegions.png")
+ggsave(out_heat, plot = p_heat, width = 14, height = 10, dpi = 300, bg = "white")
+cat("Figure 4 saved:", out_heat, "\n")
+
+
+
+# ============================================================
+# SCRIPT 11 — BLOCK F: Save Figure Inventory
+# ============================================================
+
+figure_inventory <- data.frame(
+  Figure   = c("Fig1_TrendLines_Appendicitis.png",
+               "Fig1_TrendLines_Gallbladder.png",
+               "Fig1_TrendLines_Hernia.png",
+               "Fig2_EAPC_Forest_Appendicitis.png",
+               "Fig2_EAPC_Forest_Gallbladder.png",
+               "Fig2_EAPC_Forest_Hernia.png",
+               "Fig3_Forecast_Appendicitis.png",
+               "Fig3_Forecast_Gallbladder.png",
+               "Fig3_Forecast_Hernia.png",
+               "Fig4_EAPC_Heatmap_AllRegions.png"),
+  Type     = c(rep("Trend Lines", 3),
+               rep("EAPC Forest Plot", 3),
+               rep("ARIMA Forecast", 3),
+               "EAPC Heatmap"),
+  Condition = c("Appendicitis", "Gallbladder", "Hernia",
+                "Appendicitis", "Gallbladder", "Hernia",
+                "Appendicitis", "Gallbladder", "Hernia",
+                "All"),
+  stringsAsFactors = FALSE
+)
+
+saveRDS(figure_inventory,
+        file.path(OUTPUT_DIR, "S11_figure_inventory.rds"))
+
+cat("\n✅ Script 11 complete.\n")
+cat("Total figures produced: 10\n")
+cat("All saved to:", OUTPUT_DIR, "\n")
+print(figure_inventory)
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK A: Load Environment
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+library(segmented)   # MASS loaded — dplyr:: namespace required
+
+OUTPUT_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_GBDregions/outputs/"
+
+eapc_data      <- readRDS(file.path(OUTPUT_DIR, "S09_eapc_results.rds"))
+arima_data     <- readRDS(file.path(OUTPUT_DIR, "S10_arima_results.rds"))
+s08_data       <- readRDS(file.path(OUTPUT_DIR, "S08_descriptive_tables.rds"))
+
+eapc_both      <- eapc_data$eapc_both
+eapc_both_fmt  <- eapc_data$eapc_both_fmt
+arima_val      <- arima_data$arima_validation
+arima_forecast <- arima_data$arima_forecast
+
+cat("Loaded:\n")
+cat("  eapc_both      :", nrow(eapc_both),      "rows\n")
+cat("  arima_val      :", nrow(arima_val),       "rows\n")
+cat("  arima_forecast :", nrow(arima_forecast),  "rows\n")
+
+# Shared theme
+theme_gbd <- theme_classic(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle      = element_text(size = 10, hjust = 0.5, colour = "grey40"),
+    axis.title         = element_text(size = 10, face = "bold"),
+    axis.text          = element_text(size = 9),
+    legend.position    = "bottom",
+    legend.title       = element_text(size = 9, face = "bold"),
+    legend.text        = element_text(size = 8),
+    strip.text         = element_text(size = 9, face = "bold"),
+    panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.4),
+    plot.margin        = margin(10, 12, 10, 12)
+  )
+
+measure_labels <- c(
+  "DALYs (Disability-Adjusted Life Years)" = "DALYs",
+  "Deaths"                                  = "Deaths",
+  "Incidence"                               = "Incidence"
+)
+
+cat("Environment ready.\n")
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK B: Assign SDI Values to Regions
+# Mean SDI 1990-2023 from GBD 2023 published values
+# Source: IHME GBD 2023 socio-demographic index estimates
+# ============================================================
+
+sdi_lookup <- data.frame(
+  Location = c(
+    "High-income Asia Pacific",
+    "Western Europe",
+    "Australasia",
+    "High-income North America",
+    "Southern Latin America",
+    "Central Europe",
+    "Eastern Europe",
+    "East Asia",
+    "Central Asia",
+    "North Africa and Middle East",
+    "Caribbean",
+    "Andean Latin America",
+    "Central Latin America",
+    "Tropical Latin America",
+    "Southeast Asia",
+    "South Asia",
+    "Oceania",
+    "Eastern Sub-Saharan Africa",
+    "Western Sub-Saharan Africa",
+    "Central Sub-Saharan Africa",
+    "Southern Sub-Saharan Africa"
+  ),
+  SDI_mean = c(
+    0.893,  # High-income Asia Pacific
+    0.882,  # Western Europe
+    0.878,  # Australasia
+    0.875,  # High-income North America
+    0.741,  # Southern Latin America
+    0.738,  # Central Europe
+    0.720,  # Eastern Europe
+    0.695,  # East Asia
+    0.647,  # Central Asia
+    0.607,  # North Africa and Middle East
+    0.594,  # Caribbean
+    0.578,  # Andean Latin America
+    0.641,  # Central Latin America
+    0.662,  # Tropical Latin America
+    0.618,  # Southeast Asia
+    0.498,  # South Asia
+    0.445,  # Oceania
+    0.390,  # Eastern Sub-Saharan Africa
+    0.328,  # Western Sub-Saharan Africa
+    0.314,  # Central Sub-Saharan Africa
+    0.512   # Southern Sub-Saharan Africa
+  ),
+  SDI_group = c(
+    "High", "High", "High", "High",
+    "High-middle", "High-middle", "High-middle", "High-middle",
+    "Middle", "Middle", "Middle", "Middle", "Middle", "Middle", "Middle",
+    "Low-middle",
+    "Low", "Low", "Low", "Low",
+    "Low-middle"
+  ),
+  stringsAsFactors = FALSE
+)
+
+cat("SDI lookup table:\n")
+print(sdi_lookup[order(sdi_lookup$SDI_mean, decreasing = TRUE), ])
+
+
+
+
+# ============================================================
+# ============================================================
+# SCRIPT 12 — BLOCK C (CORRECTED): Best and Worst Improving Regions
+# ============================================================
+
+rank_df <- eapc_both |>
+  dplyr::filter(Measure %in% c("Deaths",
+                               "DALYs (Disability-Adjusted Life Years)")) |>
+  dplyr::mutate(
+    Measure = dplyr::recode(Measure, !!!measure_labels),
+    Trend   = dplyr::case_when(
+      P_value >= 0.05 ~ "Stable",
+      EAPC > 0        ~ "Increasing",
+      TRUE            ~ "Decreasing"
+    )
+  ) |>
+  dplyr::arrange(Condition, Measure, EAPC) |>
+  as.data.frame()
+
+best_regions <- rank_df |>
+  dplyr::group_by(Condition, Measure) |>
+  dplyr::slice_min(order_by = EAPC, n = 5) |>
+  dplyr::mutate(Rank_Type = "Most Improved") |>
+  as.data.frame()
+
+worst_regions <- rank_df |>
+  dplyr::group_by(Condition, Measure) |>
+  dplyr::slice_max(order_by = EAPC, n = 5) |>
+  dplyr::mutate(Rank_Type = "Least Improved") |>
+  as.data.frame()
+
+rank_summary <- dplyr::bind_rows(best_regions, worst_regions) |>
+  dplyr::mutate(
+    `EAPC (95% CI)` = paste0(round(EAPC, 2), "% (",
+                             round(CI_lo, 2), "–",
+                             round(CI_hi, 2), "%)")
+  ) |>
+  dplyr::arrange(Condition, Measure, Rank_Type, EAPC) |>
+  dplyr::select(
+    Condition, Measure, Rank_Type, Location,
+    `EAPC (95% CI)`, P_value, Trend
+  ) |>
+  as.data.frame()
+
+cat("Rank summary dimensions:", nrow(rank_summary), "rows\n")
+cat("\nMost improved regions (Deaths):\n")
+print(dplyr::filter(rank_summary,
+                    Measure == "Deaths",
+                    Rank_Type == "Most Improved")[, c(1,4,5,7)])
+cat("\nLeast improved regions (Deaths):\n")
+print(dplyr::filter(rank_summary,
+                    Measure == "Deaths",
+                    Rank_Type == "Least Improved")[, c(1,4,5,7)])
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK D: SDI Correlation with EAPC
+# Pearson and Spearman correlations
+# ============================================================
+
+eapc_sdi <- eapc_both |>
+  dplyr::left_join(sdi_lookup, by = "Location") |>
+  dplyr::mutate(
+    Measure = dplyr::recode(Measure, !!!measure_labels)
+  )
+
+# Compute correlations per condition × measure
+corr_results <- lapply(
+  split(eapc_sdi, list(eapc_sdi$Condition, eapc_sdi$Measure)),
+  function(sub) {
+    if (nrow(sub) < 5 || all(is.na(sub$EAPC))) return(NULL)
+    pearson  <- cor.test(sub$SDI_mean, sub$EAPC, method = "pearson")
+    spearman <- cor.test(sub$SDI_mean, sub$EAPC, method = "spearman",
+                         exact = FALSE)
+    data.frame(
+      Condition       = sub$Condition[1],
+      Measure         = sub$Measure[1],
+      Pearson_r       = round(pearson$estimate,  3),
+      Pearson_p       = round(pearson$p.value,   4),
+      Spearman_rho    = round(spearman$estimate, 3),
+      Spearman_p      = round(spearman$p.value,  4),
+      stringsAsFactors = FALSE
+    )
+  }
+)
+
+corr_table <- as.data.frame(do.call(rbind,
+                                    Filter(Negate(is.null), corr_results)))
+corr_table <- corr_table[order(corr_table$Condition, corr_table$Measure), ]
+rownames(corr_table) <- NULL
+
+cat("SDI-EAPC Correlation Table:\n")
+print(corr_table)
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK E: Figure 5 — SDI vs EAPC Scatter
+# One panel per condition, faceted by measure
+# ============================================================
+
+cond_colours <- c(
+  "Appendicitis"                            = "#E63946",
+  "Gallbladder and biliary diseases"        = "#2196F3",
+  "Inguinal, femoral, and abdominal hernia" = "#4CAF50"
+)
+
+plot_sdi_scatter <- function(measure_name) {
+  
+  df <- eapc_sdi |>
+    dplyr::filter(Measure == measure_name)
+  
+  p <- ggplot(df, aes(x = SDI_mean, y = EAPC, colour = Condition)) +
+    geom_hline(yintercept = 0, linetype = "dashed",
+               colour = "grey50", linewidth = 0.5) +
+    geom_errorbar(aes(ymin = CI_lo, ymax = CI_hi),
+                  width = 0.008, alpha = 0.4, linewidth = 0.5) +
+    geom_point(size = 3, alpha = 0.85) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.8,
+                alpha = 0.12, formula = y ~ x) +
+    ggrepel::geom_text_repel(
+      aes(label = Location),
+      size = 2.5, max.overlaps = 15,
+      segment.colour = "grey60", segment.size = 0.3
+    ) +
+    facet_wrap(~Condition, ncol = 3, scales = "free_x") +
+    scale_colour_manual(values = cond_colours) +
+    scale_x_continuous(
+      breaks = c(0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+      labels = c("0.30","0.40","0.50","0.60","0.70","0.80","0.90")
+    ) +
+    labs(
+      title    = paste0("SDI vs EAPC by GBD Region — ", measure_name),
+      subtitle = "Age-Standardized Rate | 1990–2023 | GBD 2023 | Both Sexes",
+      x        = "Mean Socio-Demographic Index (SDI) 1990–2023",
+      y        = "EAPC (% per year) with 95% CI",
+      colour   = "Condition"
+    ) +
+    theme_gbd +
+    theme(legend.position = "none")
+  
+  out <- file.path(OUTPUT_DIR,
+                   paste0("Fig5_SDI_EAPC_Scatter_", measure_name, ".png"))
+  ggsave(out, plot = p, width = 16, height = 6, dpi = 300, bg = "white")
+  cat("Saved:", out, "\n")
+}
+
+# Install ggrepel if not present
+if (!requireNamespace("ggrepel", quietly = TRUE)) install.packages("ggrepel")
+library(ggrepel)
+
+plot_sdi_scatter("DALYs")
+plot_sdi_scatter("Deaths")
+plot_sdi_scatter("Incidence")
+
+cat("Figure 5 (3 files) complete.\n")
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK F: Figure 6 — Regional EAPC Ranking
+# Horizontal bar chart ranked by EAPC, faceted by condition
+# Deaths measure only — primary burden metric
+# ============================================================
+
+rank_deaths <- eapc_both |>
+  dplyr::filter(Measure == "Deaths") |>
+  dplyr::mutate(
+    Trend = dplyr::case_when(
+      P_value >= 0.05 ~ "Stable",
+      EAPC > 0        ~ "Increasing",
+      TRUE            ~ "Decreasing"
+    ),
+    Condition_short = dplyr::recode(Condition,
+                                    "Gallbladder and biliary diseases"        = "Gallbladder",
+                                    "Inguinal, femoral, and abdominal hernia" = "Hernia"
+    )
+  )
+
+# Order locations within each condition by EAPC
+rank_deaths <- rank_deaths |>
+  dplyr::group_by(Condition_short) |>
+  dplyr::mutate(Location_ordered = factor(
+    Location,
+    levels = Location[order(EAPC)]
+  )) |>
+  as.data.frame()
+
+p_rank <- ggplot(rank_deaths,
+                 aes(x = EAPC, y = Location_ordered, fill = Trend)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_errorbarh(aes(xmin = CI_lo, xmax = CI_hi),
+                 height = 0.35, colour = "grey30",
+                 linewidth = 0.5) +
+  geom_vline(xintercept = 0, colour = "grey30",
+             linewidth = 0.5) +
+  facet_wrap(~Condition_short, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c(
+    "Decreasing" = "#1A7340",
+    "Increasing" = "#C0392B",
+    "Stable"     = "#7D6608"
+  )) +
+  labs(
+    title    = "Regional Ranking by EAPC — Deaths (Age-Standardized Rate)",
+    subtitle = "1990–2023 | GBD 2023 | Both Sexes | Bars show 95% CI",
+    x        = "EAPC (% per year)",
+    y        = NULL,
+    fill     = "Trend Direction"
+  ) +
+  theme_gbd +
+  theme(legend.position    = "bottom",
+        panel.grid.major.x = element_line(colour = "grey92",
+                                          linewidth = 0.3),
+        panel.grid.major.y = element_blank())
+
+out_rank <- file.path(OUTPUT_DIR, "Fig6_Regional_EAPC_Ranking_Deaths.png")
+ggsave(out_rank, plot = p_rank,
+       width = 18, height = 10, dpi = 300, bg = "white")
+cat("Figure 6 saved:", out_rank, "\n")
+
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK G: Write Excel + Save RDS
+# ============================================================
+
+wb12 <- createWorkbook()
+
+hdr12 <- createStyle(
+  fontName = "Calibri", fontSize = 11, fontColour = "white",
+  fgFill   = "#3D2B56", halign = "center", valign = "center",
+  textDecoration = "bold", wrapText = TRUE,
+  border = "TopBottomLeftRight", borderColour = "#3D2B56"
+)
+body12 <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign = "center", border = "TopBottomLeftRight",
+  borderColour = "#D0D0D0"
+)
+alt12 <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign = "center", fgFill = "#F3F0F7",
+  border = "TopBottomLeftRight", borderColour = "#D0D0D0"
+)
+
+write_sheet12 <- function(wb, sheet_name, df, col_w) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, as.data.frame(df),
+            headerStyle = hdr12, borders = "all", borderStyle = "thin")
+  nr <- nrow(df)
+  nc <- ncol(df)
+  for (i in seq(2, nr + 1, by = 2)) {
+    addStyle(wb, sheet_name, alt12,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  for (i in seq(1, nr, by = 2)) {
+    addStyle(wb, sheet_name, body12,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  setColWidths(wb, sheet_name, cols = 1:nc, widths = col_w)
+  setRowHeights(wb, sheet_name, rows = 1, heights = 32)
+}
+
+# SDI lookup
+write_sheet12(wb12, "SDI_Regional_Values",
+              sdi_lookup[order(sdi_lookup$SDI_mean, decreasing = TRUE), ],
+              col_w = c(32, 12, 14))
+
+# Rank summary
+write_sheet12(wb12, "Regional_Ranking_EAPC",
+              rank_summary,
+              col_w = c(38, 12, 16, 30, 28, 10, 14))
+
+# SDI correlation table
+write_sheet12(wb12, "SDI_EAPC_Correlation",
+              corr_table,
+              col_w = c(38, 12, 14, 12, 14, 12))
+
+out_file12 <- file.path(OUTPUT_DIR, "S12_CrossRegional_Comparison.xlsx")
+saveWorkbook(wb12, out_file12, overwrite = TRUE)
+
+saveRDS(list(sdi_lookup   = sdi_lookup,
+             rank_summary = rank_summary,
+             corr_table   = corr_table,
+             eapc_sdi     = eapc_sdi),
+        file.path(OUTPUT_DIR, "S12_crossregional_results.rds"))
+
+cat("✅ Script 12 complete.\n")
+cat("Excel saved to:", out_file12, "\n")
+cat("\n")
+cat("========================================\n")
+cat("  REGIONAL ANALYSIS PIPELINE COMPLETE\n")
+cat("  Scripts 07-12 all finished\n")
+cat("  Outputs in:\n")
+cat(" ", OUTPUT_DIR, "\n")
+cat("========================================\n")
+
+
+# ============================================================
+# SCRIPT 12 — ENVIRONMENT RELOAD (Run after reopening R)
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+library(segmented)
+library(forecast)
+library(tseries)
+
+OUTPUT_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_GBDregions/outputs/"
+
+# --- Reload all RDS checkpoints ---
+regional_data         <- readRDS(file.path(OUTPUT_DIR, "S07_regional_data_full.rds"))
+regional_asr_both     <- readRDS(file.path(OUTPUT_DIR, "S07_regional_asr_both.rds"))
+regional_asr_sex      <- readRDS(file.path(OUTPUT_DIR, "S07_regional_asr_sex.rds"))
+regional_counts_both  <- readRDS(file.path(OUTPUT_DIR, "S07_regional_counts_both.rds"))
+regional_counts_sex   <- readRDS(file.path(OUTPUT_DIR, "S07_regional_counts_sex.rds"))
+regional_allages_rate <- readRDS(file.path(OUTPUT_DIR, "S07_regional_allages_rate.rds"))
+
+s08_data       <- readRDS(file.path(OUTPUT_DIR, "S08_descriptive_tables.rds"))
+
+eapc_data      <- readRDS(file.path(OUTPUT_DIR, "S09_eapc_results.rds"))
+eapc_both      <- eapc_data$eapc_both
+eapc_both_fmt  <- eapc_data$eapc_both_fmt
+eapc_sex       <- eapc_data$eapc_sex
+eapc_sex_fmt   <- eapc_data$eapc_sex_fmt
+
+arima_data     <- readRDS(file.path(OUTPUT_DIR, "S10_arima_results.rds"))
+arima_val      <- arima_data$arima_validation
+arima_forecast <- arima_data$arima_forecast
+forecast_table <- arima_data$forecast_table
+
+# --- Shared objects ---
+measure_labels <- c(
+  "DALYs (Disability-Adjusted Life Years)" = "DALYs",
+  "Deaths"                                  = "Deaths",
+  "Incidence"                               = "Incidence"
+)
+
+theme_gbd <- theme_classic(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle      = element_text(size = 10, hjust = 0.5, colour = "grey40"),
+    axis.title         = element_text(size = 10, face = "bold"),
+    axis.text          = element_text(size = 9),
+    legend.position    = "bottom",
+    legend.title       = element_text(size = 9, face = "bold"),
+    legend.text        = element_text(size = 8),
+    strip.text         = element_text(size = 9, face = "bold"),
+    panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.4),
+    plot.margin        = margin(10, 12, 10, 12)
+  )
+
+cond_colours <- c(
+  "Appendicitis"                            = "#E63946",
+  "Gallbladder and biliary diseases"        = "#2196F3",
+  "Inguinal, femoral, and abdominal hernia" = "#4CAF50"
+)
+
+sdi_lookup <- data.frame(
+  Location = c(
+    "High-income Asia Pacific", "Western Europe", "Australasia",
+    "High-income North America", "Southern Latin America",
+    "Central Europe", "Eastern Europe", "East Asia",
+    "Central Asia", "North Africa and Middle East",
+    "Caribbean", "Andean Latin America", "Central Latin America",
+    "Tropical Latin America", "Southeast Asia", "South Asia",
+    "Oceania", "Eastern Sub-Saharan Africa", "Western Sub-Saharan Africa",
+    "Central Sub-Saharan Africa", "Southern Sub-Saharan Africa"
+  ),
+  SDI_mean = c(
+    0.893, 0.882, 0.878, 0.875, 0.741, 0.738, 0.720, 0.695,
+    0.647, 0.607, 0.594, 0.578, 0.641, 0.662, 0.618, 0.498,
+    0.445, 0.390, 0.328, 0.314, 0.512
+  ),
+  SDI_group = c(
+    "High", "High", "High", "High",
+    "High-middle", "High-middle", "High-middle", "High-middle",
+    "Middle", "Middle", "Middle", "Middle", "Middle", "Middle", "Middle",
+    "Low-middle", "Low", "Low", "Low", "Low", "Low-middle"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# --- Verify ---
+cat("Environment reloaded successfully.\n\n")
+cat("Key objects:\n")
+cat("  regional_asr_both  :", nrow(regional_asr_both),  "rows\n")
+cat("  regional_counts_both:", nrow(regional_counts_both), "rows\n")
+cat("  eapc_both          :", nrow(eapc_both),           "rows\n")
+cat("  arima_forecast     :", nrow(arima_forecast),      "rows\n")
+cat("  sdi_lookup         :", nrow(sdi_lookup),          "rows\n")
+
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK H: Combined Regional Burden Analysis
+# Mirrors global/SDI combined burden approach
+# Dual EAPC: ASR trends + absolute count trends
+# Interpretation column distinguishes true epidemiological
+# change from population growth effects
+# ============================================================
+
+# --- Step 1: EAPC on age-standardized rates (true epi change) ---
+calc_eapc <- function(years, rates) {
+  tryCatch({
+    if (any(is.na(rates)) || any(rates <= 0) || length(rates) < 5)
+      return(list(eapc = NA, ci_lo = NA, ci_hi = NA, pval = NA))
+    ln_rates <- log(rates)
+    fit      <- lm(ln_rates ~ years)
+    beta     <- coef(fit)["years"]
+    se       <- summary(fit)$coefficients["years", "Std. Error"]
+    list(
+      eapc  = (exp(beta) - 1) * 100,
+      ci_lo = (exp(beta - 1.96 * se) - 1) * 100,
+      ci_hi = (exp(beta + 1.96 * se) - 1) * 100,
+      pval  = summary(fit)$coefficients["years", "Pr(>|t|)"]
+    )
+  }, error = function(e)
+    list(eapc = NA, ci_lo = NA, ci_hi = NA, pval = NA))
+}
+
+# --- Step 2: EAPC on all-ages counts (population growth + epi) ---
+# Use both sexes, all-ages, Number metric
+combined_counts <- regional_counts_both |>
+  dplyr::filter(sex == "Both")
+
+groups_cnt <- combined_counts |>
+  dplyr::group_by(location, cause, measure) |>
+  dplyr::group_split()
+
+eapc_cnt_list <- lapply(groups_cnt, function(s) {
+  s    <- s[order(s$year), ]
+  res  <- calc_eapc(s$year, s$val)
+  data.frame(
+    Location  = as.character(s$location[1]),
+    Condition = as.character(s$cause[1]),
+    Measure   = as.character(s$measure[1]),
+    EAPC_cnt  = res$eapc,
+    CI_lo_cnt = res$ci_lo,
+    CI_hi_cnt = res$ci_hi,
+    Pval_cnt  = res$pval,
+    stringsAsFactors = FALSE
+  )
+})
+eapc_counts_df <- as.data.frame(do.call(rbind, eapc_cnt_list))
+
+cat("EAPC on counts computed:", nrow(eapc_counts_df), "rows\n")
+cat("NA in count EAPC:", sum(is.na(eapc_counts_df$EAPC_cnt)), "\n")
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK I: Merge + Interpretation Column
+# ============================================================
+
+fmt_eapc_ci <- function(e, lo, hi) {
+  if (is.na(e)) return(NA_character_)
+  paste0(round(e, 2), "% (", round(lo, 2), "–", round(hi, 2), "%)")
+}
+
+fmt_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  formatC(p, format = "f", digits = 3)
+}
+
+# ASR EAPC (from Script 09 results — already computed)
+eapc_asr_df <- eapc_both |>
+  dplyr::select(
+    Location, Condition, Measure,
+    EAPC_asr  = EAPC,
+    CI_lo_asr = CI_lo,
+    CI_hi_asr = CI_hi,
+    Pval_asr  = P_value
+  )
+
+# Merge ASR + Count EAPCs
+combined_eapc <- dplyr::inner_join(
+  eapc_asr_df,
+  eapc_counts_df,
+  by = c("Location", "Condition", "Measure")
+)
+
+cat("Merged combined EAPC rows:", nrow(combined_eapc), "\n")
+
+# Interpretation logic (mirrors global/SDI approach):
+# ASR declining + Count declining  → True burden reduction
+# ASR declining + Count stable/inc → Population growth masking real improvement
+# ASR stable    + Count increasing → Pure population growth effect
+# ASR increasing + Count increasing → True burden increase
+# ASR increasing + Count stable    → Ageing effect without incidence rise
+# ASR stable + Count stable        → No meaningful change
+
+combined_eapc <- combined_eapc |>
+  dplyr::mutate(
+    ASR_direction = dplyr::case_when(
+      is.na(EAPC_asr)  ~ "Undetermined",
+      Pval_asr >= 0.05 ~ "Stable",
+      EAPC_asr > 0     ~ "Increasing",
+      TRUE             ~ "Decreasing"
+    ),
+    Cnt_direction = dplyr::case_when(
+      is.na(EAPC_cnt)  ~ "Undetermined",
+      Pval_cnt >= 0.05 ~ "Stable",
+      EAPC_cnt > 0     ~ "Increasing",
+      TRUE             ~ "Decreasing"
+    ),
+    Interpretation = dplyr::case_when(
+      ASR_direction == "Decreasing" & Cnt_direction == "Decreasing" ~
+        "True burden reduction",
+      ASR_direction == "Decreasing" & Cnt_direction == "Stable" ~
+        "Epidemiological improvement; stable absolute burden",
+      ASR_direction == "Decreasing" & Cnt_direction == "Increasing" ~
+        "Epidemiological improvement offset by population growth",
+      ASR_direction == "Stable"     & Cnt_direction == "Increasing" ~
+        "Population growth effect; no true rate change",
+      ASR_direction == "Stable"     & Cnt_direction == "Stable" ~
+        "No meaningful change",
+      ASR_direction == "Increasing" & Cnt_direction == "Increasing" ~
+        "True burden increase",
+      ASR_direction == "Increasing" & Cnt_direction == "Stable" ~
+        "Rate increasing; population decline offsetting counts",
+      ASR_direction == "Increasing" & Cnt_direction == "Decreasing" ~
+        "Rate increasing; population decline masking count reduction",
+      TRUE ~ "Undetermined"
+    )
+  ) |>
+  as.data.frame()
+
+cat("\nInterpretation distribution:\n")
+print(table(combined_eapc$Interpretation))
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK J: Format Publication-Ready Table
+# ============================================================
+
+combined_table <- combined_eapc |>
+  dplyr::mutate(
+    Measure_short = dplyr::recode(Measure, !!!measure_labels),
+    `EAPC ASR (95% CI)`   = mapply(fmt_eapc_ci,
+                                   EAPC_asr, CI_lo_asr, CI_hi_asr),
+    `P-value ASR`         = sapply(Pval_asr, fmt_p),
+    `EAPC Count (95% CI)` = mapply(fmt_eapc_ci,
+                                   EAPC_cnt, CI_lo_cnt, CI_hi_cnt),
+    `P-value Count`       = sapply(Pval_cnt, fmt_p)
+  ) |>
+  dplyr::select(
+    Region          = Location,
+    Condition,
+    Measure         = Measure_short,
+    `EAPC ASR (95% CI)`,
+    `P-value ASR`,
+    `EAPC Count (95% CI)`,
+    `P-value Count`,
+    `ASR Trend`     = ASR_direction,
+    `Count Trend`   = Cnt_direction,
+    Interpretation
+  ) |>
+  dplyr::arrange(Condition, Measure, Region) |>
+  as.data.frame()
+
+cat("Combined burden table:", nrow(combined_table), "rows x",
+    ncol(combined_table), "cols\n")
+cat("\nPreview (first 4 rows):\n")
+print(head(combined_table, 4))
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK K: Figure — Interpretation Tile Plot
+# All 21 regions × 3 conditions × 3 measures
+# Colour = interpretation category
+# ============================================================
+
+interp_colours <- c(
+  "True burden reduction"                              = "#1A7340",
+  "Epidemiological improvement; stable absolute burden" = "#52B788",
+  "Epidemiological improvement offset by population growth" = "#95D5B2",
+  "Population growth effect; no true rate change"      = "#F4A261",
+  "No meaningful change"                               = "#ADB5BD",
+  "True burden increase"                               = "#C0392B",
+  "Rate increasing; population decline offsetting counts" = "#E76F51",
+  "Rate increasing; population decline masking count reduction" = "#9B2226",
+  "Undetermined"                                       = "#DEE2E6"
+)
+
+tile_df <- combined_eapc |>
+  dplyr::mutate(
+    Measure_short = dplyr::recode(Measure, !!!measure_labels),
+    Condition_short = dplyr::recode(Condition,
+                                    "Gallbladder and biliary diseases"        = "Gallbladder",
+                                    "Inguinal, femoral, and abdominal hernia" = "Hernia"
+    ),
+    Col_label = paste0(Condition_short, "\n", Measure_short)
+  )
+
+# Order regions by SDI
+region_sdi_order <- sdi_lookup |>
+  dplyr::arrange(SDI_mean) |>
+  dplyr::pull(Location)
+
+tile_df$Location <- factor(tile_df$Location, levels = region_sdi_order)
+
+col_order <- c(
+  "Appendicitis\nDALYs",   "Appendicitis\nDeaths",   "Appendicitis\nIncidence",
+  "Gallbladder\nDALYs",    "Gallbladder\nDeaths",    "Gallbladder\nIncidence",
+  "Hernia\nDALYs",         "Hernia\nDeaths",          "Hernia\nIncidence"
+)
+tile_df$Col_label <- factor(tile_df$Col_label, levels = col_order)
+
+p_tile <- ggplot(tile_df,
+                 aes(x = Col_label, y = Location, fill = Interpretation)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  scale_fill_manual(values = interp_colours, name = "Interpretation") +
+  labs(
+    title    = "Combined Burden Interpretation — All GBD Regions",
+    subtitle = "ASR trend vs absolute count trend | 1990–2023 | GBD 2023 | Both Sexes",
+    x        = NULL,
+    y        = "Region (ordered by SDI, low → high)"
+  ) +
+  theme_gbd +
+  theme(
+    axis.text.x     = element_text(size = 8, angle = 30, hjust = 1),
+    axis.text.y     = element_text(size = 8),
+    legend.position = "right",
+    legend.text     = element_text(size = 7.5),
+    panel.grid      = element_blank()
+  )
+
+out_tile <- file.path(OUTPUT_DIR,
+                      "Fig7_Combined_Burden_Interpretation_Tile.png")
+ggsave(out_tile, plot = p_tile,
+       width = 16, height = 10, dpi = 300, bg = "white")
+cat("Figure 7 saved:", out_tile, "\n")
+
+
+
+
+
+# ============================================================
+# SCRIPT 12 — BLOCK L: Write Excel + Save RDS
+# ============================================================
+
+wb12 <- createWorkbook()
+
+hdr12 <- createStyle(
+  fontName = "Calibri", fontSize = 11, fontColour = "white",
+  fgFill   = "#3D2B56", halign = "center", valign = "center",
+  textDecoration = "bold", wrapText = TRUE,
+  border = "TopBottomLeftRight", borderColour = "#3D2B56"
+)
+body12 <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign = "center", border = "TopBottomLeftRight",
+  borderColour = "#D0D0D0"
+)
+alt12 <- createStyle(
+  fontName = "Calibri", fontSize = 10, halign = "left",
+  valign = "center", fgFill = "#F3F0F7",
+  border = "TopBottomLeftRight", borderColour = "#D0D0D0"
+)
+
+# Interpretation colour styles for Excel
+interp_styles <- list(
+  "True burden reduction" =
+    createStyle(fgFill = "#C7F2D5", fontColour = "#1A7340",
+                textDecoration = "bold"),
+  "Epidemiological improvement; stable absolute burden" =
+    createStyle(fgFill = "#D8F3E3", fontColour = "#2D6A4F"),
+  "Epidemiological improvement offset by population growth" =
+    createStyle(fgFill = "#EAF7EE", fontColour = "#40916C"),
+  "Population growth effect; no true rate change" =
+    createStyle(fgFill = "#FDE8D0", fontColour = "#C05E1A"),
+  "No meaningful change" =
+    createStyle(fgFill = "#F0F1F3", fontColour = "#6C757D"),
+  "True burden increase" =
+    createStyle(fgFill = "#FAD7D7", fontColour = "#C0392B",
+                textDecoration = "bold"),
+  "Rate increasing; population decline offsetting counts" =
+    createStyle(fgFill = "#FDECEA", fontColour = "#9B2226"),
+  "Rate increasing; population decline masking count reduction" =
+    createStyle(fgFill = "#F5C6CB", fontColour = "#6B0F1A",
+                textDecoration = "bold")
+)
+
+write_sheet12 <- function(wb, sheet_name, df, col_w) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, as.data.frame(df),
+            headerStyle = hdr12, borders = "all", borderStyle = "thin")
+  nr <- nrow(df)
+  nc <- ncol(df)
+  for (i in seq(2, nr + 1, by = 2)) {
+    addStyle(wb, sheet_name, alt12,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  for (i in seq(1, nr, by = 2)) {
+    addStyle(wb, sheet_name, body12,
+             rows = i + 1, cols = 1:nc, gridExpand = TRUE)
+  }
+  setColWidths(wb, sheet_name, cols = 1:nc, widths = col_w)
+  setRowHeights(wb, sheet_name, rows = 1, heights = 32)
+}
+
+# Sheet 1 — Combined burden table with colour-coded interpretation
+addWorksheet(wb12, "Combined_Burden_EAPC")
+writeData(wb12, "Combined_Burden_EAPC",
+          as.data.frame(combined_table),
+          headerStyle = hdr12, borders = "all", borderStyle = "thin")
+nr <- nrow(combined_table)
+nc <- ncol(combined_table)
+interp_col <- which(names(combined_table) == "Interpretation")
+for (i in 1:nr) {
+  row_i <- i + 1
+  # Alternate row base
+  base_sty <- if (i %% 2 == 0) alt12 else body12
+  addStyle(wb12, "Combined_Burden_EAPC", base_sty,
+           rows = row_i, cols = 1:nc, gridExpand = TRUE)
+  # Overlay interpretation colour
+  interp_val <- combined_table$Interpretation[i]
+  if (!is.na(interp_val) && interp_val %in% names(interp_styles)) {
+    addStyle(wb12, "Combined_Burden_EAPC",
+             interp_styles[[interp_val]],
+             rows = row_i, cols = interp_col, stack = TRUE)
+  }
+}
+setColWidths(wb12, "Combined_Burden_EAPC",
+             cols = 1:nc,
+             widths = c(28, 38, 10, 24, 12, 24, 12, 14, 14, 48))
+setRowHeights(wb12, "Combined_Burden_EAPC", rows = 1, heights = 32)
+
+# Sheet 2 — SDI lookup
+write_sheet12(wb12, "SDI_Regional_Values",
+              sdi_lookup[order(sdi_lookup$SDI_mean, decreasing = TRUE), ],
+              col_w = c(32, 12, 14))
+
+out_file12 <- file.path(OUTPUT_DIR, "S12_Combined_Regional_Burden.xlsx")
+saveWorkbook(wb12, out_file12, overwrite = TRUE)
+
+# Final RDS
+saveRDS(list(
+  combined_eapc   = combined_eapc,
+  combined_table  = combined_table,
+  eapc_counts_df  = eapc_counts_df,
+  sdi_lookup      = sdi_lookup
+), file.path(OUTPUT_DIR, "S12_combined_burden_results.rds"))
+
+cat("✅ Script 12 combined burden analysis complete.\n")
+cat("Excel saved to:", out_file12, "\n")
+cat("\n")
+cat("=====================================================\n")
+cat("  FULL REGIONAL PIPELINE COMPLETE — Scripts 07–12\n")
+cat("  All RDS checkpoints and Excel outputs saved.\n")
+cat("=====================================================\n")
+
+
+
+
+# ============================================================
+# SDI-stratified trends figure — equivalent of Figure 1
+# All 6 locations (Global + 5 SDI) × 3 conditions × 3 measures
+# Age-standardized rates, Both sexes, 1990-2023
+# ============================================================
+
+library(tidyverse)
+library(ggplot2)
+library(scales)
+
+OUTPUT_DIR  <- "D:/Research/GBD GI Surgery Burden/GBD_GI_Global_SDI/outputs"
+FIGURES_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_Global_SDI/outputs/figures"
+if (!dir.exists(FIGURES_DIR)) dir.create(FIGURES_DIR, recursive = TRUE)
+
+df_asr <- readRDS(file.path(OUTPUT_DIR, "df_asr.rds"))
+
+# SDI color palette — same as your existing figures
+sdi_colors <- c(
+  "Global"          = "#2E4057",
+  "Low SDI"         = "#E63946",
+  "Low-middle SDI"  = "#F4A261",
+  "Middle SDI"      = "#2A9D8F",
+  "High-middle SDI" = "#457B9D",
+  "High SDI"        = "#6A0572"
+)
+
+# Line thickness — Global bolder
+sdi_sizes <- c(
+  "Global"          = 1.2,
+  "Low SDI"         = 0.75,
+  "Low-middle SDI"  = 0.75,
+  "Middle SDI"      = 0.75,
+  "High-middle SDI" = 0.75,
+  "High SDI"        = 0.75
+)
+
+theme_gbd <- function() {
+  theme_classic(base_size = 11) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 12, hjust = 0),
+      plot.subtitle      = element_text(size = 9, color = "grey40", hjust = 0),
+      axis.title         = element_text(size = 10),
+      axis.text          = element_text(size = 8),
+      legend.title       = element_text(size = 9, face = "bold"),
+      legend.text        = element_text(size = 8),
+      legend.position    = "bottom",
+      legend.key.size    = unit(0.5, "cm"),
+      strip.text         = element_text(face = "bold", size = 9),
+      strip.background   = element_rect(fill = "#f0f4f8", color = NA),
+      panel.grid.major.y = element_line(color = "grey92", linewidth = 0.4),
+      panel.grid.major.x = element_blank(),
+      plot.margin        = margin(8, 10, 8, 8)
+    )
+}
+
+# ── Build panel labels ───────────────────────────────────────
+fig_sdi_data <- df_asr %>%
+  dplyr::filter(sex == "Both") %>%
+  dplyr::mutate(
+    measure_label = dplyr::recode(as.character(measure),
+                                  "Incidence"                              = "Incidence",
+                                  "Deaths"                                 = "Mortality",
+                                  "DALYs (Disability-Adjusted Life Years)" = "DALYs"
+    ),
+    measure_label = factor(measure_label,
+                           levels = c("Incidence", "Mortality", "DALYs")),
+    panel = paste0(cause_short, "\n", measure_label),
+    panel = factor(panel, levels = c(
+      "Appendicitis\nIncidence",  "Appendicitis\nMortality",  "Appendicitis\nDALYs",
+      "Hernia\nIncidence",        "Hernia\nMortality",        "Hernia\nDALYs",
+      "Gallbladder\nIncidence",   "Gallbladder\nMortality",   "Gallbladder\nDALYs"
+    )),
+    location = factor(location,
+                      levels = c("Global", "Low SDI", "Low-middle SDI",
+                                 "Middle SDI", "High-middle SDI", "High SDI"))
+  )
+
+# ── Plot ────────────────────────────────────────────────────
+fig_sdi <- ggplot(fig_sdi_data,
+                  aes(x = year, y = value,
+                      color    = location,
+                      linewidth = location)) +
+  # 95% UI ribbon for Global only to avoid clutter
+  geom_ribbon(
+    data = dplyr::filter(fig_sdi_data, location == "Global"),
+    aes(ymin = lower, ymax = upper, fill = location),
+    alpha = 0.12, color = NA
+  ) +
+  geom_line() +
+  facet_wrap(~ panel, scales = "free", ncol = 3) +
+  scale_color_manual(values = sdi_colors, name = "Location") +
+  scale_fill_manual(values  = sdi_colors, guide = "none") +
+  scale_linewidth_manual(values = sdi_sizes, guide = "none") +
+  scale_x_continuous(breaks = c(1990, 2000, 2010, 2023),
+                     labels = c("1990","2000","2010","2023")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Figure. Age-standardized rates of essential GI surgical diseases by SDI level, 1990–2023",
+    subtitle = "Both sexes combined; shaded area = Global 95% uncertainty interval",
+    x        = "Year",
+    y        = "Age-standardized rate per 100,000"
+  ) +
+  theme_gbd() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  guides(color = guide_legend(nrow = 1, override.aes = list(linewidth = 1)))
+
+ggsave(file.path(FIGURES_DIR, "Fig_SDI_Trends_AllConditions.png"),
+       fig_sdi, width = 13, height = 10, dpi = 300, bg = "white")
+
+cat("✅ SDI trends figure saved\n")
+cat("   Path:", file.path(FIGURES_DIR, "Fig_SDI_Trends_AllConditions.png"), "\n")
+
+
+# ============================================================
+# SDI-stratified ARIMA Forecast Figure
+# 9 panels: 3 conditions × 3 measures
+# All 6 locations (Global + 5 SDI), Both sexes
+# Observed 1990-2023 + Forecast 2024-2035
+# ============================================================
+
+library(tidyverse)
+library(ggplot2)
+library(scales)
+
+OUTPUT_DIR  <- "D:/Research/GBD GI Surgery Burden/GBD_GI_Global_SDI/outputs"
+FIGURES_DIR <- "D:/Research/GBD GI Surgery Burden/GBD_GI_Global_SDI/outputs/figures"
+
+df_asr        <- readRDS(file.path(OUTPUT_DIR, "df_asr.rds"))
+arima_results <- readRDS(file.path(OUTPUT_DIR, "arima_results.rds"))
+
+sdi_colors <- c(
+  "Global"          = "#2E4057",
+  "Low SDI"         = "#E63946",
+  "Low-middle SDI"  = "#F4A261",
+  "Middle SDI"      = "#2A9D8F",
+  "High-middle SDI" = "#457B9D",
+  "High SDI"        = "#6A0572"
+)
+
+sdi_sizes <- c(
+  "Global"          = 1.2,
+  "Low SDI"         = 0.75,
+  "Low-middle SDI"  = 0.75,
+  "Middle SDI"      = 0.75,
+  "High-middle SDI" = 0.75,
+  "High SDI"        = 0.75
+)
+
+theme_gbd <- function() {
+  theme_classic(base_size = 11) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 12, hjust = 0),
+      plot.subtitle      = element_text(size = 9, color = "grey40", hjust = 0),
+      axis.title         = element_text(size = 10),
+      axis.text          = element_text(size = 8),
+      legend.title       = element_text(face = "bold", size = 9),
+      legend.text        = element_text(size = 8),
+      legend.position    = "bottom",
+      legend.key.size    = unit(0.5, "cm"),
+      strip.text         = element_text(face = "bold", size = 9),
+      strip.background   = element_rect(fill = "#f0f4f8", color = NA),
+      panel.grid.major.y = element_line(color = "grey92", linewidth = 0.4),
+      panel.grid.major.x = element_blank(),
+      plot.margin        = margin(8, 10, 8, 8)
+    )
+}
+
+# ── Observed data (1990-2023) ────────────────────────────────
+obs_data <- df_asr %>%
+  dplyr::filter(sex == "Both") %>%
+  dplyr::mutate(
+    period     = "Observed",
+    value_lo   = lower,
+    value_hi   = upper
+  ) %>%
+  dplyr::select(location, cause_short, measure,
+                year, value, value_lo, value_hi, period)
+
+# ── Forecast data (2024-2035) ────────────────────────────────
+fc_data <- arima_results %>%
+  dplyr::mutate(
+    period   = "Forecast",
+    value    = forecast,
+    value_lo = lower_95,
+    value_hi = upper_95,
+    cause_short = factor(cause_short,
+                         levels = c("Appendicitis","Hernia","Gallbladder")),
+    measure = factor(measure,
+                     levels = c("Incidence","Deaths",
+                                "DALYs (Disability-Adjusted Life Years)"))
+  ) %>%
+  dplyr::select(location, cause_short, measure,
+                year, value, value_lo, value_hi, period)
+
+# ── Connector point (last observed year = 2023) ──────────────
+connector <- obs_data %>%
+  dplyr::filter(year == 2023) %>%
+  dplyr::mutate(period = "Forecast")
+
+# ── Combine ──────────────────────────────────────────────────
+fig_data <- bind_rows(obs_data, connector, fc_data) %>%
+  dplyr::mutate(
+    measure_label = dplyr::recode(as.character(measure),
+                                  "Incidence"                              = "Incidence",
+                                  "Deaths"                                 = "Mortality",
+                                  "DALYs (Disability-Adjusted Life Years)" = "DALYs"
+    ),
+    measure_label = factor(measure_label,
+                           levels = c("Incidence","Mortality","DALYs")),
+    panel = paste0(as.character(cause_short), "\n", measure_label),
+    panel = factor(panel, levels = c(
+      "Appendicitis\nIncidence",  "Appendicitis\nMortality",  "Appendicitis\nDALYs",
+      "Hernia\nIncidence",        "Hernia\nMortality",        "Hernia\nDALYs",
+      "Gallbladder\nIncidence",   "Gallbladder\nMortality",   "Gallbladder\nDALYs"
+    )),
+    location = factor(location,
+                      levels = c("Global","Low SDI","Low-middle SDI",
+                                 "Middle SDI","High-middle SDI","High SDI")),
+    # Dashed line for forecast period
+    line_type = ifelse(period == "Forecast", "Forecast", "Observed")
+  )
+
+# ── PI ribbons for forecast (Global only to avoid clutter) ───
+fc_ribbon <- fig_data %>%
+  dplyr::filter(period == "Forecast", location == "Global")
+
+obs_ribbon <- fig_data %>%
+  dplyr::filter(period == "Observed", location == "Global")
+
+# ── Plot ─────────────────────────────────────────────────────
+fig_arima_sdi <- ggplot(fig_data,
+                        aes(x         = year,
+                            y         = value,
+                            color     = location,
+                            linewidth = location,
+                            linetype  = line_type)) +
+  
+  # Global 95% UI ribbon (observed) — x explicit
+  geom_ribbon(
+    data = obs_ribbon,
+    aes(x = year, ymin = value_lo, ymax = value_hi, fill = location),
+    alpha = 0.10, color = NA, inherit.aes = FALSE
+  ) +
+  
+  # Global 95% PI ribbon (forecast) — x explicit
+  geom_ribbon(
+    data = fc_ribbon,
+    aes(x = year, ymin = value_lo, ymax = value_hi, fill = location),
+    alpha = 0.18, color = NA, inherit.aes = FALSE
+  ) +
+  
+  geom_line() +
+  
+  geom_vline(xintercept = 2023, linetype = "dotted",
+             color = "grey50", linewidth = 0.45) +
+  
+  facet_wrap(~ panel, scales = "free", ncol = 3) +
+  
+  scale_color_manual(values = sdi_colors, name = "Location") +
+  scale_fill_manual(values  = sdi_colors, guide = "none") +
+  scale_linewidth_manual(values = sdi_sizes, guide = "none") +
+  scale_linetype_manual(
+    values = c("Observed" = 1, "Forecast" = 2),
+    name   = "Period"
+  ) +
+  scale_x_continuous(
+    breaks = c(1990, 2000, 2010, 2023, 2030, 2035),
+    labels = c("1990","2000","2010","2023","2030","2035")
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  
+  labs(
+    title    = "Figure. Age-standardized rates by SDI level: observed 1990–2023 and ARIMA forecast 2024–2035",
+    subtitle = "Both sexes; dashed lines = forecast period; shaded area = Global 95% UI/PI; dotted line = projection start",
+    x        = "Year",
+    y        = "Age-standardized rate per 100,000"
+  ) +
+  theme_gbd() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  guides(
+    color    = guide_legend(nrow = 1,
+                            override.aes = list(linewidth = 1,
+                                                linetype  = 1)),
+    linetype = guide_legend(nrow = 1)
+  )
+
+ggsave(
+  file.path(FIGURES_DIR, "Fig_SDI_ARIMA_Forecast.png"),
+  fig_arima_sdi,
+  width  = 13,
+  height = 10,
+  dpi    = 300,
+  bg     = "white"
+)
+
+cat("✅ SDI ARIMA forecast figure saved\n")
